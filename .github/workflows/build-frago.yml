@@ -1,0 +1,100 @@
+
+name: Build Frago ARM64 APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      - name: Extract Frago source ZIP
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p extracted
+
+          ZIP_FILE=$(find . -maxdepth 2 -type f -iname "*.zip" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP source file found!"
+            exit 1
+          fi
+
+          echo "Extracting: $ZIP_FILE"
+          unzip -q "$ZIP_FILE" -d extracted
+
+          PROJECT_DIR=$(find extracted -type f \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            -printf '%h\n' | head -n 1)
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: Android project not found in ZIP!"
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Found project: $PROJECT_DIR"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Release APK
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+
+          if [ ! -f "./gradlew" ]; then
+            echo "ERROR: Gradle wrapper not found!"
+            exit 1
+          fi
+
+          chmod +x ./gradlew
+
+          ./gradlew --no-daemon clean assembleRelease
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p "$GITHUB_WORKSPACE/output"
+
+          find "$PROJECT_DIR" -type f -name "*.apk" \
+            -path "*/build/outputs/apk/*" \
+            -exec cp {} "$GITHUB_WORKSPACE/output/" \;
+
+          if [ -z "$(ls -A "$GITHUB_WORKSPACE/output")" ]; then
+            echo "ERROR: No APK generated!"
+            exit 1
+          fi
+
+          echo "Generated APK files:"
+          ls -lh "$GITHUB_WORKSPACE/output"
+
+      - name: Upload Frago APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Frago-ARM64-APK
+          path: output/*.apk
+          if-no-files-found: error
+          retention-days: 14
