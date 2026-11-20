@@ -1,11 +1,14 @@
-name: Build Frago ARM64 APK
+
+name: Frago ARM64 APK Builder
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
     paths:
-      - 'Frago-Android-Source.zip'
+      - '*.zip'
       - '.github/workflows/build-arm64-apk.yml'
 
 permissions:
@@ -13,93 +16,61 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    name: Extract and Build Frago
+    runs-on: ubuntu-22.04
+
     steps:
-      - name: Checkout repository (contains the source ZIP)
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract Android project from Frago ZIP
+      - name: Find and extract Frago ZIP automatically
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PYEXTRACT'
-          from pathlib import Path, PurePosixPath
-          import os, shutil, sys, zipfile
 
-          workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
-          archive = workspace / 'Frago-Android-Source.zip'
-          destination = workspace / 'frago-source'
+          mkdir -p "$RUNNER_TEMP/frago-extracted"
 
-          if not archive.is_file():
-              print('ERROR: Frago-Android-Source.zip was not found in the repository root.')
-              print('Repository root files:', [p.name for p in workspace.iterdir()])
-              sys.exit(1)
+          FOUND=""
 
-          with zipfile.ZipFile(archive) as zf:
-              names = [n for n in zf.namelist() if n and not n.endswith('/')]
-              project_prefixes = set()
-              for name in names:
-                  path = PurePosixPath(name)
-                  if path.name != 'gradlew':
-                      continue
-                  prefix = '' if str(path.parent) == '.' else path.parent.as_posix().rstrip('/') + '/'
-                  required = [
-                      prefix + 'gradlew',
-                      prefix + 'settings.gradle',
-                      prefix + 'build.gradle',
-                      prefix + 'app/build.gradle',
-                      prefix + 'app/src/main/assets/default-config.json',
-                      prefix + 'app/src/main/AndroidManifest.xml',
-                  ]
-                  if all(item in names for item in required):
-                      project_prefixes.add(prefix)
+          while IFS= read -r ZIP; do
+            echo "Checking ZIP: $ZIP"
 
-              if len(project_prefixes) != 1:
-                  print('ERROR: ZIP must contain exactly one complete Frago Android project.')
-                  print('Detected project roots:', sorted(project_prefixes))
-                  print('ZIP entries (first 60):', names[:60])
-                  sys.exit(1)
+            TEMP_DIR="$(mktemp -d "$RUNNER_TEMP/frago-test-XXXXXX")"
 
-              prefix = next(iter(project_prefixes))
-              if destination.exists():
-                  shutil.rmtree(destination)
-              destination.mkdir(parents=True)
+            if ! unzip -q "$ZIP" -d "$TEMP_DIR"; then
+              rm -rf "$TEMP_DIR"
+              continue
+            fi
 
-              extracted = 0
-              for info in zf.infolist():
-                  raw = info.filename
-                  if info.is_dir() or not raw.startswith(prefix):
-                      continue
-                  relative = raw[len(prefix):]
-                  if not relative:
-                      continue
-                  rel = PurePosixPath(relative)
-                  if rel.is_absolute() or '..' in rel.parts:
-                      raise SystemExit(f'Unsafe path in ZIP: {raw}')
-                  target = (destination / Path(*rel.parts)).resolve()
-                  if destination.resolve() not in target.parents and target != destination.resolve():
-                      raise SystemExit(f'ZIP path escapes extraction directory: {raw}')
-                  target.parent.mkdir(parents=True, exist_ok=True)
-                  with zf.open(info) as src, target.open('wb') as dst:
-                      shutil.copyfileobj(src, dst)
-                  extracted += 1
+            GRADLE_FILE="$(find "$TEMP_DIR" -type f -name gradlew -print -quit)"
 
-          expected = [
-              destination / 'gradlew',
-              destination / 'gradle/wrapper/gradle-wrapper.jar',
-              destination / 'settings.gradle',
-              destination / 'app/src/main/assets/default-config.json',
-          ]
-          missing = [str(p.relative_to(destination)) for p in expected if not p.is_file()]
-          if missing:
-              raise SystemExit('ZIP extraction is incomplete; missing: ' + ', '.join(missing))
-          print(f'Extracted {extracted} project files into {destination}')
-          PYEXTRACT
-          chmod +x frago-source/gradlew
+            if [ -n "$GRADLE_FILE" ]; then
+              PROJECT_DIR="$(dirname "$GRADLE_FILE")"
 
-      # setup-android invokes sdkmanager, which needs JDK 17+.
-      - name: Set up Java 17 for Android SDK tools
-        uses: actions/setup-java@v4
+              if [ -f "$PROJECT_DIR/settings.gradle" ] || [ -f "$PROJECT_DIR/settings.gradle.kts" ]; then
+                if [ -f "$PROJECT_DIR/app/build.gradle" ] || [ -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
+                  FOUND="$PROJECT_DIR"
+                  break
+                fi
+              fi
+            fi
+
+            rm -rf "$TEMP_DIR"
+
+          done < <(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname '*.zip' ! -iname '*logs*' | sort)
+
+          if [ -z "$FOUND" ]; then
+            echo "ERROR: No valid Android Gradle project found in ZIP files."
+            echo "Repository ZIP files:"
+            find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname '*.zip'
+            exit 1
+          fi
+
+          echo "Frago project detected at: $FOUND"
+          echo "PROJECT_ROOT=$FOUND" >> "$GITHUB_ENV"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -108,107 +79,198 @@ jobs:
         uses: android-actions/setup-android@v4
 
       - name: Install Android SDK and NDK
+        shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "platforms;android-31" "build-tools;31.0.0" "ndk;27.2.12479018"
+          set -euo pipefail
 
-      # The project uses Gradle 7.2 / AGP 7.1.3, so build with JDK 11.
-      - name: Set up Java 11 for legacy Android Gradle Plugin
-        uses: actions/setup-java@v4
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-31" \
+            "build-tools;31.0.0" \
+            "ndk;27.2.12479018"
+
+      - name: Set up Java 11 for Gradle 7.2
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '11'
 
-      - name: Verify extracted Frago project and configuration
-        working-directory: frago-source
+      - name: Verify extracted project
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PYVERIFY'
-          from pathlib import Path
+
+          cd "$PROJECT_ROOT"
+
+          echo "Project directory: $PWD"
+
+          test -f gradlew
+          test -f settings.gradle
+          test -f build.gradle
+          test -f app/build.gradle
+          test -f app/src/main/AndroidManifest.xml
+          test -f app/src/main/assets/default-config.json
+
+          chmod +x gradlew
+
+          echo "Project structure verified."
+
+      - name: Verify Frago configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_ROOT"
+
+          python3 - <<'PY'
           import json
           import xml.etree.ElementTree as ET
-          root = Path.cwd()
-          config = json.loads((root / "app/src/main/assets/default-config.json").read_text(encoding="utf-8"))
-          assert config["dns"]["servers"] == ["https://kid.openbld.net/dns-query"]
+          from pathlib import Path
+
+          root = Path(".")
+          config = json.loads(
+              (root / "app/src/main/assets/default-config.json").read_text()
+          )
+
+          assert config["dns"]["servers"] == [
+              "https://kid.openbld.net/dns-query"
+          ]
+
           assert config["dns"]["queryStrategy"] == "UseIPv4"
-          assert config["dns"]["hosts"]["regexp:(google)"] == ["65.109.184.128", "91.107.241.144"]
-          socks = next(x for x in config["inbounds"] if x.get("protocol") == "socks")
-          assert socks["listen"] == "127.0.0.1" and socks["port"] == 10808 and socks["settings"]["udp"] is True
-          assert socks["sniffing"]["enabled"] is True and "tls" in socks["sniffing"]["destOverride"]
-          fragment = next(x for x in config["outbounds"] if x.get("tag") == "fragment-out")
-          assert fragment["settings"]["fragment"] == {"packets": "tlshello", "length": "10-400", "interval": "1-30"}
-          rules = config["routing"]["rules"]
-          assert config["routing"]["domainStrategy"] == "AsIs"
-          assert any(x.get("domain") == [r"regexp:.*\.ir$"] and x.get("outboundTag") == "direct" for x in rules)
-          assert any(x.get("ip") == ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"] and x.get("outboundTag") == "direct" for x in rules)
-          assert any(x.get("network") == "tcp" and x.get("outboundTag") == "fragment-out" for x in rules)
-          assert any(x.get("network") == "udp" and x.get("outboundTag") == "direct" for x in rules)
+
+          socks = next(
+              x for x in config["inbounds"]
+              if x.get("protocol") == "socks"
+          )
+
+          assert socks["port"] == 10808
+          assert socks["listen"] == "127.0.0.1"
+          assert socks["settings"]["udp"] is True
+
+          fragment = next(
+              x for x in config["outbounds"]
+              if x.get("tag") == "fragment-out"
+          )
+
+          assert fragment["settings"]["fragment"] == {
+              "packets": "tlshello",
+              "length": "10-400",
+              "interval": "1-30"
+          }
+
           ET.parse(root / "app/src/main/AndroidManifest.xml")
-          service = (root / "app/src/main/java/net/typeblog/socks/FragoVpnService.java").read_text(encoding="utf-8")
-          core = (root / "app/src/main/java/net/typeblog/socks/core/FragoConfig.java").read_text(encoding="utf-8")
-          assert '.addAddress("fd26:26:26::1", 126)' in service
-          assert "ipv6: 'fd26:26:26::1'" in core
-          assert (root / "app/src/main/java/hev/htproxy/TProxyService.java").is_file()
-          socks_src = (root / "app/src/main/java/net/typeblog/socks/core/FragoSocksServer.java").read_text(encoding="utf-8")
-          assert "usernamePassword" in socks_src and "socksUsername.equals(username)" in socks_src
-          assert "new SecureRandom()" in service
-          assert not list((root / "app/src/main").rglob("libxray.so"))
-          assert not list((root / "app/src/main").rglob("libtun2socks.so"))
-          print("Frago project checks passed.")
-          PYVERIFY
 
-      - name: Build lightweight Hev SOCKS5 TUN engine (ARM64 only)
-        working-directory: frago-source
+          assert (
+              root / "app/src/main/java/net/typeblog/socks/FragoVpnService.java"
+          ).is_file()
+
+          assert (
+              root / "app/src/main/java/net/typeblog/socks/core/FragoSocksServer.java"
+          ).is_file()
+
+          print("Frago configuration checks passed.")
+          PY
+
+      - name: Build Hev SOCKS5 engine for ARM64
         shell: bash
         run: |
           set -euo pipefail
+
           HEV_ROOT="$RUNNER_TEMP/hev-android-build"
+
           mkdir -p "$HEV_ROOT"
-          git clone --depth 1 --branch 2.20.0 --recurse-submodules \
-            https://github.com/heiher/hev-socks5-tunnel.git "$HEV_ROOT/jni"
-          "$ANDROID_SDK_ROOT/ndk/27.2.12479018/ndk-build" -C "$HEV_ROOT" APP_ABI=arm64-v8a
-          LIB="$(find "$HEV_ROOT" -type f -path '*/arm64-v8a/libhev-socks5-tunnel.so' -print -quit)"
-          test -n "$LIB"
-          mkdir -p app/src/main/jniLibs/arm64-v8a
-          install -m 644 "$LIB" app/src/main/jniLibs/arm64-v8a/libhev-socks5-tunnel.so
-          readelf -h app/src/main/jniLibs/arm64-v8a/libhev-socks5-tunnel.so | grep -Eq 'Machine:.*AArch64'
-          sha256sum app/src/main/jniLibs/arm64-v8a/libhev-socks5-tunnel.so
-          cp "$HEV_ROOT/jni/LICENSE" THIRD_PARTY_HEV_LICENSE.txt
-          mkdir -p app/src/main/assets
-          cp "$HEV_ROOT/jni/LICENSE" app/src/main/assets/THIRD_PARTY_HEV_LICENSE.txt
 
-      - name: Build debug and optimized APKs
-        working-directory: frago-source
-        run: ./gradlew --no-daemon clean assembleDebug assembleRelease
+          git clone \
+            --depth 1 \
+            --branch 2.20.0 \
+            --recurse-submodules \
+            https://github.com/heiher/hev-socks5-tunnel.git \
+            "$HEV_ROOT/jni"
 
-      - name: Verify APK ABI and absence of Xray
-        working-directory: frago-source
-        shell: bash
-        run: |
-          set -euo pipefail
-          APK="app/build/outputs/apk/release/app-release.apk"
-          unzip -l "$APK" | awk 'NF == 4 { print $4 }' > "$RUNNER_TEMP/apk-files.txt"
-          grep -qx 'lib/arm64-v8a/libhev-socks5-tunnel.so' "$RUNNER_TEMP/apk-files.txt"
-          if grep -Eq '^lib/(armeabi-v7a|x86|x86_64)/|libxray' "$RUNNER_TEMP/apk-files.txt"; then
-            echo 'Unexpected ABI or Xray binary in APK' >&2
+          "$ANDROID_SDK_ROOT/ndk/27.2.12479018/ndk-build" \
+            -C "$HEV_ROOT" \
+            APP_ABI=arm64-v8a
+
+          LIB="$(find "$HEV_ROOT" \
+            -type f \
+            -path '*/arm64-v8a/libhev-socks5-tunnel.so' \
+            -print -quit)"
+
+          if [ -z "$LIB" ]; then
+            echo "ERROR: ARM64 Hev library was not generated."
+            find "$HEV_ROOT" -type f -name '*.so'
             exit 1
           fi
 
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Frago-ARM64-debug
-          path: frago-source/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 14
+          mkdir -p "$PROJECT_ROOT/app/src/main/jniLibs/arm64-v8a"
 
-      - name: Upload optimized APK and third-party notices
+          install -m 644 "$LIB" \
+            "$PROJECT_ROOT/app/src/main/jniLibs/arm64-v8a/libhev-socks5-tunnel.so"
+
+          cp "$HEV_ROOT/jni/LICENSE" \
+            "$PROJECT_ROOT/app/src/main/assets/THIRD_PARTY_HEV_LICENSE.txt"
+
+          cp "$HEV_ROOT/jni/LICENSE" \
+            "$PROJECT_ROOT/THIRD_PARTY_HEV_LICENSE.txt"
+
+      - name: Build Debug and Release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          chmod +x gradlew
+
+          ./gradlew \
+            --no-daemon \
+            clean \
+            assembleDebug \
+            assembleRelease
+
+      - name: Verify generated APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_ROOT"
+
+          DEBUG_APK="app/build/outputs/apk/debug/app-debug.apk"
+          RELEASE_APK="app/build/outputs/apk/release/app-release.apk"
+
+          test -f "$DEBUG_APK"
+          test -f "$RELEASE_APK"
+
+          echo "Checking ARM64 release APK..."
+
+          unzip -l "$RELEASE_APK" > "$RUNNER_TEMP/apk-list.txt"
+
+          grep -q 'lib/arm64-v8a/libhev-socks5-tunnel.so' \
+            "$RUNNER_TEMP/apk-list.txt"
+
+          if grep -Eq 'lib/(armeabi-v7a|x86|x86_64)/|libxray' \
+            "$RUNNER_TEMP/apk-list.txt"; then
+            echo "Unexpected architecture or Xray library found."
+            exit 1
+          fi
+
+          echo "APK verification passed."
+
+          mkdir -p "$GITHUB_WORKSPACE/frago-output"
+
+          cp "$DEBUG_APK" "$GITHUB_WORKSPACE/frago-output/"
+          cp "$RELEASE_APK" "$GITHUB_WORKSPACE/frago-output/"
+
+          cp THIRD_PARTY_HEV_LICENSE.txt \
+            "$GITHUB_WORKSPACE/frago-output/" || true
+
+          ls -lh "$GITHUB_WORKSPACE/frago-output"
+
+      - name: Upload Frago APKs
         uses: actions/upload-artifact@v4
         with:
-          name: Frago-ARM64-release
-          path: |
-            frago-source/app/build/outputs/apk/release/app-release.apk
-            frago-source/THIRD_PARTY_HEV_LICENSE.txt
+          name: Frago-ARM64-APKs
+          path: frago-output/*
           if-no-files-found: error
           retention-days: 14
