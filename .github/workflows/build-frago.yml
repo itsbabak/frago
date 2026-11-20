@@ -39,7 +39,42 @@ jobs:
           java-version: '11'
 
       - name: Verify Frago JSON and Android project
-        run: python3 verify_project.py
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYVERIFY'
+          from pathlib import Path
+          import json
+          import xml.etree.ElementTree as ET
+          root = Path.cwd()
+          config = json.loads((root / "app/src/main/assets/default-config.json").read_text(encoding="utf-8"))
+          assert config["dns"]["servers"] == ["https://kid.openbld.net/dns-query"]
+          assert config["dns"]["queryStrategy"] == "UseIPv4"
+          assert config["dns"]["hosts"]["regexp:(google)"] == ["65.109.184.128", "91.107.241.144"]
+          socks = next(x for x in config["inbounds"] if x.get("protocol") == "socks")
+          assert socks["listen"] == "127.0.0.1" and socks["port"] == 10808 and socks["settings"]["udp"] is True
+          assert socks["sniffing"]["enabled"] is True and "tls" in socks["sniffing"]["destOverride"]
+          fragment = next(x for x in config["outbounds"] if x.get("tag") == "fragment-out")
+          assert fragment["settings"]["fragment"] == {"packets": "tlshello", "length": "10-400", "interval": "1-30"}
+          rules = config["routing"]["rules"]
+          assert config["routing"]["domainStrategy"] == "AsIs"
+          assert any(x.get("domain") == [r"regexp:.*\.ir$"] and x.get("outboundTag") == "direct" for x in rules)
+          assert any(x.get("ip") == ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"] and x.get("outboundTag") == "direct" for x in rules)
+          assert any(x.get("network") == "tcp" and x.get("outboundTag") == "fragment-out" for x in rules)
+          assert any(x.get("network") == "udp" and x.get("outboundTag") == "direct" for x in rules)
+          ET.parse(root / "app/src/main/AndroidManifest.xml")
+          service = (root / "app/src/main/java/net/typeblog/socks/FragoVpnService.java").read_text(encoding="utf-8")
+          core = (root / "app/src/main/java/net/typeblog/socks/core/FragoConfig.java").read_text(encoding="utf-8")
+          assert '.addAddress("fd26:26:26::1", 126)' in service
+          assert "ipv6: 'fd26:26:26::1'" in core
+          assert (root / "app/src/main/java/hev/htproxy/TProxyService.java").is_file()
+          socks_src = (root / "app/src/main/java/net/typeblog/socks/core/FragoSocksServer.java").read_text(encoding="utf-8")
+          assert "usernamePassword" in socks_src and "socksUsername.equals(username)" in socks_src
+          assert "new SecureRandom()" in service
+          assert not list((root / "app/src/main").rglob("libxray.so"))
+          assert not list((root / "app/src/main").rglob("libtun2socks.so"))
+          print("Frago project checks passed.")
+          PYVERIFY
 
       - name: Build lightweight Hev SOCKS5 TUN engine (ARM64 only)
         shell: bash
