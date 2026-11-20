@@ -99,7 +99,7 @@ jobs:
                           prefixes = project_prefixes(zf.namelist())
                       if prefixes:
                           name = archive.name.lower()
-                          score = (2 if "frago" in name else 0) + (1 if "source" in name else 0) + (40 if "compile-fixed3" in name else (30 if "compile-fixed2" in name else (20 if "compile-fixed" in name else (10 if ("fixed" in name or "patched" in name) else 0))))
+                          score = (2 if "frago" in name else 0) + (1 if "source" in name else 0) + (50 if "compile-fixed4" in name else (40 if "compile-fixed3" in name else (30 if "compile-fixed2" in name else (20 if "compile-fixed" in name else (10 if ("fixed" in name or "patched" in name) else 0)))))
                           candidates.append((score, archive.stat().st_size, str(archive), archive, prefixes[0]))
                           print(f"Found Frago project in ZIP: {archive} (internal root: {prefixes[0] or '.'})")
                   except (zipfile.BadZipFile, OSError) as exc:
@@ -115,7 +115,7 @@ jobs:
                       print(f"  - {p.name}{'/' if p.is_dir() else ''}")
                   raise SystemExit(1)
 
-              # Prefer the newest compile-fixed3 UDP/fragment archive, then compile-fixed2,
+              # Prefer the compile-fixed4 TLS-record fragmentation archive, then compile-fixed3 UDP,
               # other fixed/patched archives, and finally a clearly named Frago source archive.
               candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
               _, _, _, selected_zip, prefix = candidates[0]
@@ -170,6 +170,18 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+
+      - name: Verify independent TLS ClientHello record fragmentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$FRAGO_PROJECT_DIR"
+          TEST_DIR="$RUNNER_TEMP/frago-tls-fragment-test"
+          mkdir -p "$TEST_DIR"
+          javac -d "$TEST_DIR" \
+            app/src/main/java/net/typeblog/socks/engine/FragoTlsHelloFragmenter.java \
+            tools/TlsHelloFragmenterSmokeTest.java
+          java -cp "$TEST_DIR" TlsHelloFragmenterSmokeTest
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
