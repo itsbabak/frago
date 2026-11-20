@@ -36,9 +36,9 @@ jobs:
           set -euo pipefail
           java -version
           sdkmanager --version
-          # Process substitution prevents `yes` receiving SIGPIPE from
-          # turning a successful license acceptance into exit code 141.
-          sdkmanager --licenses < <(yes) >/dev/null
+          # Feed a finite batch of affirmative answers. This avoids the
+          # `yes | sdkmanager` SIGPIPE/Broken-pipe failure.
+          sdkmanager --licenses <<< "$(printf 'y\n%.0s' {1..100})"
 
       - name: Install required Android SDK packages
         shell: bash
@@ -49,27 +49,62 @@ jobs:
             "build-tools;31.0.0" \
             "platform-tools"
 
-      # AGP 7.1.3 / Gradle 7.2 build stage.
+      # AGP 7.1.3 / Gradle 7.2 build stage uses JDK 11.
       - name: Set up JDK 11 for Gradle build
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '11'
 
-      - name: Verify build environment
+      - name: Locate Frago project root
+        id: locate-project
         shell: bash
         run: |
           set -euo pipefail
+          WRAPPER="$(find "$GITHUB_WORKSPACE" -type f -name gradlew \
+            -not -path '*/.gradle/*' -print -quit)"
+
+          if [ -z "$WRAPPER" ]; then
+            echo "ERROR: gradlew was not found in the checked-out repository."
+            echo "Make sure you extracted the source ZIP and committed its contents, not the ZIP file itself."
+            echo "Repository files near the root:"
+            find "$GITHUB_WORKSPACE" -maxdepth 5 -type f \
+              \( -name gradlew -o -name settings.gradle -o -name build.gradle \) \
+              -print | sed -n '1,100p'
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$WRAPPER")"
+          if [ ! -f "$PROJECT_DIR/settings.gradle" ] && [ ! -f "$PROJECT_DIR/settings.gradle.kts" ]; then
+            echo "ERROR: Found gradlew at $PROJECT_DIR, but no settings.gradle(.kts) beside it."
+            exit 1
+          fi
+          if [ ! -f "$PROJECT_DIR/app/build.gradle" ] && [ ! -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
+            echo "ERROR: Found Gradle root at $PROJECT_DIR, but app/build.gradle(.kts) is missing."
+            exit 1
+          fi
+
+          echo "Frago project root: $PROJECT_DIR"
+          echo "FRAGO_PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Verify Gradle wrapper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$FRAGO_PROJECT_DIR"
           java -version
           chmod +x ./gradlew
+          test -f gradle/wrapper/gradle-wrapper.jar
+          test -f gradle/wrapper/gradle-wrapper.properties
           ./gradlew --version
 
       - name: Build Frago release APK (ARM64)
         shell: bash
         run: |
           set -euo pipefail
+          cd "$FRAGO_PROJECT_DIR"
           ./gradlew --no-daemon clean assembleRelease
-          APK="app/build/outputs/apk/release/app-release.apk"
+          APK="$FRAGO_PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
           test -s "$APK"
           APK_SIZE_BYTES=$(stat -c%s "$APK")
           APK_SHA256=$(sha256sum "$APK" | awk '{print $1}')
@@ -94,6 +129,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Frago-ARM64-APK
-          path: app/build/outputs/apk/release/app-release.apk
+          path: '**/app/build/outputs/apk/release/app-release.apk'
           if-no-files-found: error
           retention-days: 14
