@@ -99,7 +99,7 @@ jobs:
                           prefixes = project_prefixes(zf.namelist())
                       if prefixes:
                           name = archive.name.lower()
-                          score = (2 if "frago" in name else 0) + (1 if "source" in name else 0)
+                          score = (2 if "frago" in name else 0) + (1 if "source" in name else 0) + (20 if "compile-fixed" in name else (10 if ("fixed" in name or "patched" in name) else 0))
                           candidates.append((score, archive.stat().st_size, str(archive), archive, prefixes[0]))
                           print(f"Found Frago project in ZIP: {archive} (internal root: {prefixes[0] or '.'})")
                   except (zipfile.BadZipFile, OSError) as exc:
@@ -115,8 +115,8 @@ jobs:
                       print(f"  - {p.name}{'/' if p.is_dir() else ''}")
                   raise SystemExit(1)
 
-              # Prefer a clearly named Frago source archive, then the larger
-              # complete source archive. This also works when multiple ZIPs exist.
+              # Prefer the compile-fixed archive first, then other fixed/patched archives,
+              # then a clearly named Frago source archive.
               candidates.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
               _, _, _, selected_zip, prefix = candidates[0]
               destination = Path(os.environ["RUNNER_TEMP"]) / "frago-source"
