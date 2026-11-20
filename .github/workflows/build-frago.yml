@@ -39,7 +39,7 @@ jobs:
           java-version: '11'
 
       - name: Verify Frago JSON and Android project
-        run: python3 tools/verify_project.py
+        run: python3 verify_project.py
 
       - name: Build lightweight Hev SOCKS5 TUN engine (ARM64 only)
         shell: bash
