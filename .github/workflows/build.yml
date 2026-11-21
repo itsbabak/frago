@@ -1,5 +1,5 @@
 
-name: Build Frago 1.4.7 ARM64 APK
+name: Build Frago ARM64 APK
 
 on:
   workflow_dispatch:
@@ -21,8 +21,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. پیدا کردن پروژه یا استخراج ZIP
-      - name: Locate or extract Frago project
+      # 2. پیدا کردن پروژه Gradle یا استخراج ZIP
+      - name: Locate Frago project
         id: locate
         shell: bash
         run: |
@@ -36,19 +36,15 @@ jobs:
             while IFS= read -r -d '' wrapper; do
               project="$(dirname "$wrapper")"
 
-              if [[ -f "$project/settings.gradle" || \
-                    -f "$project/settings.gradle.kts" ]]; then
-
-                if [[ -f "$project/app/build.gradle" || \
-                      -f "$project/app/build.gradle.kts" ]]; then
+              if [[ -f "$project/settings.gradle" || -f "$project/settings.gradle.kts" ]]; then
+                if [[ -f "$project/app/build.gradle" || -f "$project/app/build.gradle.kts" ]]; then
                   printf '%s\n' "$project"
                   return 0
                 fi
               fi
             done < <(
               find "$root" \
-                -type f \
-                -name gradlew \
+                -type f -name gradlew \
                 -not -path '*/.git/*' \
                 -not -path '*/.gradle/*' \
                 -not -path '*/build/*' \
@@ -66,8 +62,8 @@ jobs:
             EXTRACT_BASE="$GITHUB_WORKSPACE/.frago-extracted"
             mkdir -p "$EXTRACT_BASE"
 
-            FOUND=false
             INDEX=0
+            FOUND=false
 
             while IFS= read -r -d '' ARCHIVE; do
               INDEX=$((INDEX + 1))
@@ -75,7 +71,7 @@ jobs:
 
               mkdir -p "$DEST"
 
-              echo "Extracting: $ARCHIVE"
+              echo "Extracting $ARCHIVE"
 
               if ! unzip -oq "$ARCHIVE" -d "$DEST"; then
                 continue
@@ -91,41 +87,37 @@ jobs:
             done < <(
               find "$GITHUB_WORKSPACE" \
                 -maxdepth 4 \
-                -type f \
-                -iname '*.zip' \
+                -type f -iname '*.zip' \
                 -not -path '*/.git/*' \
                 -not -path '*/.frago-extracted/*' \
                 -print0
             )
 
             if [[ "$FOUND" != true ]]; then
-              echo "::error::Frago project not found."
+              echo "::error::Frago Gradle project not found."
               exit 1
             fi
           fi
 
           PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
 
-          test -f "$PROJECT_DIR/gradlew"
-          test -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml"
-
           chmod +x "$PROJECT_DIR/gradlew"
 
-          echo "Project: $PROJECT_DIR"
+          echo "Project directory: $PROJECT_DIR"
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
-      # 3. نصب Java 17
+      # 3. Java 17
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 4. نصب Android SDK
+      # 4. Android SDK
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      # 5. نصب SDK 36
+      # 5. نصب SDK
       - name: Install Android SDK components
         shell: bash
         run: |
@@ -136,8 +128,8 @@ jobs:
             "build-tools;36.0.0" \
             "platform-tools"
 
-      # 6. اصلاح Gradle و تنظیمات Android
-      - name: Configure Android Gradle build
+      # 6. تشخیص AIDL و تنظیمات Gradle
+      - name: Configure Frago Android project
         shell: bash
         working-directory: ${{ steps.locate.outputs.project_dir }}
         run: |
@@ -148,176 +140,244 @@ jobs:
           import re
           import sys
 
-          root = Path(".")
-          app_file = root / "app" / "build.gradle"
-          root_file = root / "build.gradle"
-          wrapper_file = root / "gradle" / "wrapper" / "gradle-wrapper.properties"
+          app = Path("app")
+          gradle = app / "build.gradle"
+          kotlin_gradle = app / "build.gradle.kts"
 
-          if not app_file.exists():
+          if gradle.exists():
+              file = gradle
+              kotlin = False
+          elif kotlin_gradle.exists():
+              file = kotlin_gradle
+              kotlin = True
+          else:
               sys.exit("ERROR: app/build.gradle not found")
 
-          if not root_file.exists():
-              sys.exit("ERROR: root build.gradle not found")
+          source = file.read_text(encoding="utf-8")
 
-          if not wrapper_file.exists():
-              sys.exit("ERROR: Gradle wrapper properties not found")
+          # Find actual AIDL file
+          aidl_files = list((app / "src").rglob("IVpnService.aidl"))
 
-          # Root Android Gradle Plugin
-          root_text = root_file.read_text(encoding="utf-8")
+          if not aidl_files:
+              sys.exit("ERROR: IVpnService.aidl not found")
 
-          root_text, count = re.subn(
-              r"com\.android\.tools\.build:gradle:[0-9.]+",
-              "com.android.tools.build:gradle:8.10.1",
-              root_text
+          aidl = aidl_files[0]
+
+          print("AIDL file:", aidl)
+
+          aidl_text = aidl.read_text(encoding="utf-8")
+
+          package_match = re.search(
+              r"^\s*package\s+([A-Za-z0-9_.]+)\s*;",
+              aidl_text,
+              re.MULTILINE
           )
 
-          if count == 0:
-              sys.exit("ERROR: Android Gradle Plugin declaration not found")
+          if not package_match:
+              sys.exit("ERROR: AIDL package declaration not found")
 
-          root_file.write_text(root_text, encoding="utf-8")
+          package = package_match.group(1)
 
-          # Gradle Wrapper
-          wrapper_text = wrapper_file.read_text(encoding="utf-8")
+          print("AIDL package:", package)
 
-          wrapper_text = re.sub(
-              r"gradle-[0-9.]+-(?:all|bin)\.zip",
-              "gradle-8.11.1-all.zip",
-              wrapper_text
-          )
+          # Find Java/Kotlin package references
+          package_dirs = list((app / "src" / "main").rglob("*.java"))
 
-          wrapper_file.write_text(wrapper_text, encoding="utf-8")
+          if not package_dirs:
+              package_dirs = list((app / "src" / "main").rglob("*.kt"))
 
-          # App Gradle
-          app_text = app_file.read_text(encoding="utf-8")
+          namespaces = []
 
-          # Add namespace
-          if not re.search(r"\bnamespace\s+['\"]", app_text):
-              match = re.search(r"\bandroid\s*\{", app_text)
-
-              if not match:
-                  sys.exit("ERROR: android block not found")
-
-              insert_at = match.end()
-
-              app_text = (
-                  app_text[:insert_at]
-                  + "\n    namespace 'net.typeblog.socks'\n"
-                  + app_text[insert_at:]
+          for source_file in package_dirs:
+              text = source_file.read_text(
+                  encoding="utf-8",
+                  errors="ignore"
               )
 
-          # Enable BuildConfig and AIDL
-          build_features = re.search(
-              r"\bbuildFeatures\s*\{",
-              app_text
-          )
+              match = re.search(
+                  r"^\s*package\s+([A-Za-z0-9_.]+)",
+                  text,
+                  re.MULTILINE
+              )
+
+              if match:
+                  namespaces.append(match.group(1))
+
+          namespace = "net.typeblog.socks"
+
+          if package in namespaces:
+              namespace = package
+
+          print("Selected namespace:", namespace)
+
+          # Ensure android block exists
+          android_match = re.search(r"\bandroid\s*\{", source)
+
+          if not android_match:
+              sys.exit("ERROR: android block not found")
+
+          def insert_into_block(text, block_name, lines):
+              pattern = re.search(
+                  rf"\b{re.escape(block_name)}\s*\{{",
+                  text
+              )
+
+              if not pattern:
+                  return None
+
+              start = pattern.end()
+              depth = 1
+              pos = start
+
+              while pos < len(text) and depth:
+                  if text[pos] == "{":
+                      depth += 1
+                  elif text[pos] == "}":
+                      depth -= 1
+                  pos += 1
+
+              if depth != 0:
+                  sys.exit(f"ERROR: invalid {block_name} block")
+
+              block = text[pattern.start():pos]
+
+              for key, line in lines.items():
+                  if not re.search(rf"\b{re.escape(key)}\b", block):
+                      block = block[:-1] + "\n    " + line + "\n}"
+
+              return text[:pattern.start()] + block + text[pos:]
+
+          # Namespace
+          if kotlin:
+              namespace_line = f'namespace = "{namespace}"'
+          else:
+              namespace_line = f"namespace '{namespace}'"
+
+          if not re.search(r"\bnamespace\b", source):
+              source = source[:android_match.end()] + \
+                  "\n    " + namespace_line + "\n" + \
+                  source[android_match.end():]
+
+          # Build features
+          build_features = re.search(r"\bbuildFeatures\s*\{", source)
 
           if not build_features:
-              match = re.search(r"\bandroid\s*\{", app_text)
+              android_match = re.search(r"\bandroid\s*\{", source)
 
-              if not match:
-                  sys.exit("ERROR: android block not found")
-
-              insert_at = match.end()
-
-              app_text = (
-                  app_text[:insert_at]
-                  + """
+              if kotlin:
+                  block = """
+              buildFeatures {
+                  buildConfig = true
+                  aidl = true
+              }
+          """
+              else:
+                  block = """
               buildFeatures {
                   buildConfig true
                   aidl true
               }
-
           """
-                  + app_text[insert_at:]
+
+              source = (
+                  source[:android_match.end()]
+                  + block
+                  + source[android_match.end():]
               )
           else:
               start = build_features.end()
               depth = 1
               pos = start
 
-              while pos < len(app_text) and depth:
-                  if app_text[pos] == "{":
+              while pos < len(source) and depth:
+                  if source[pos] == "{":
                       depth += 1
-                  elif app_text[pos] == "}":
+                  elif source[pos] == "}":
                       depth -= 1
                   pos += 1
 
-              block = app_text[build_features.start():pos]
+              block = source[build_features.start():pos]
 
-              if not re.search(r"\bbuildConfig\s+true", block):
-                  block = block[:-1] + "\n    buildConfig true\n}"
+              if kotlin:
+                  if not re.search(r"\bbuildConfig\s*=\s*true", block):
+                      block = block[:-1] + "\n    buildConfig = true\n}"
 
-              if not re.search(r"\baidl\s+true", block):
-                  block = block[:-1] + "\n    aidl true\n}"
+                  if not re.search(r"\baidl\s*=\s*true", block):
+                      block = block[:-1] + "\n    aidl = true\n}"
+              else:
+                  if not re.search(r"\bbuildConfig\s+true", block):
+                      block = block[:-1] + "\n    buildConfig true\n}"
 
-              app_text = (
-                  app_text[:build_features.start()]
-                  + block
-                  + app_text[pos:]
-              )
+                  if not re.search(r"\baidl\s+true", block):
+                      block = block[:-1] + "\n    aidl true\n}"
 
-          # Upgrade compile SDK
-          if re.search(r"\bcompileSdkVersion\s+\d+", app_text):
-              app_text = re.sub(
-                  r"\bcompileSdkVersion\s+\d+",
+              source = source[:build_features.start()] + block + source[pos:]
+
+          # Compile SDK
+          if re.search(r"\bcompileSdkVersion\s*\(?\s*\d+", source):
+              source = re.sub(
+                  r"\bcompileSdkVersion\s*\(?\s*\d+\)?",
                   "compileSdkVersion 36",
-                  app_text,
+                  source,
                   count=1
               )
-          elif re.search(r"\bcompileSdk\s+\d+", app_text):
-              app_text = re.sub(
-                  r"\bcompileSdk\s+\d+",
-                  "compileSdk 36",
-                  app_text,
+          elif re.search(r"\bcompileSdk\s*=?\s*\d+", source):
+              source = re.sub(
+                  r"\bcompileSdk\s*=?\s*\d+",
+                  "compileSdk = 36" if kotlin else "compileSdk 36",
+                  source,
                   count=1
               )
           else:
-              app_text = re.sub(
-                  r"(\bandroid\s*\{)",
-                  r"\1\n    compileSdkVersion 36",
-                  app_text,
-                  count=1
-              )
+              android_match = re.search(r"\bandroid\s*\{", source)
+              line = "compileSdk = 36" if kotlin else "compileSdk 36"
+              source = source[:android_match.end()] + \
+                  "\n    " + line + "\n" + source[android_match.end():]
 
-          # Upgrade target SDK
-          if re.search(r"\btargetSdkVersion\s+\d+", app_text):
-              app_text = re.sub(
-                  r"\btargetSdkVersion\s+\d+",
+          # Target SDK
+          if re.search(r"\btargetSdkVersion\s*\(?\s*\d+", source):
+              source = re.sub(
+                  r"\btargetSdkVersion\s*\(?\s*\d+\)?",
                   "targetSdkVersion 36",
-                  app_text,
+                  source,
                   count=1
               )
-          elif re.search(r"\btargetSdk\s+\d+", app_text):
-              app_text = re.sub(
-                  r"\btargetSdk\s+\d+",
-                  "targetSdk 36",
-                  app_text,
+          elif re.search(r"\btargetSdk\s*=?\s*\d+", source):
+              source = re.sub(
+                  r"\btargetSdk\s*=?\s*\d+",
+                  "targetSdk = 36" if kotlin else "targetSdk 36",
+                  source,
                   count=1
               )
           else:
-              app_text = re.sub(
-                  r"(\bdefaultConfig\s*\{)",
-                  r"\1\n        targetSdkVersion 36",
-                  app_text,
-                  count=1
-              )
+              default_config = re.search(r"\bdefaultConfig\s*\{", source)
 
-          app_file.write_text(app_text, encoding="utf-8")
+              if not default_config:
+                  sys.exit("ERROR: defaultConfig block not found")
 
-          print("Android Gradle configuration updated.")
-          print("AGP: 8.10.1")
-          print("Gradle: 8.11.1")
-          print("Namespace: net.typeblog.socks")
+              line = "targetSdk = 36" if kotlin else "targetSdk 36"
+
+              source = source[:default_config.end()] + \
+                  "\n        " + line + "\n" + \
+                  source[default_config.end():]
+
+          file.write_text(source, encoding="utf-8")
+
+          print("Gradle configuration updated.")
+          print("Namespace:", namespace)
           print("BuildConfig: enabled")
           print("AIDL: enabled")
           print("compileSdk: 36")
           print("targetSdk: 36")
           PY
 
-          echo "----- Updated app/build.gradle -----"
-          cat app/build.gradle
+          echo "========== FINAL GRADLE =========="
+          cat app/build.gradle 2>/dev/null || cat app/build.gradle.kts
 
-      # 7. کنترل تنظیمات قبل از Build
+          echo "========== AIDL =========="
+          find app/src -type f -name '*.aidl' -print
+
+      # 7. تشخیص تنظیمات بدون توقف مبهم
       - name: Verify Android configuration
         shell: bash
         working-directory: ${{ steps.locate.outputs.project_dir }}
@@ -325,54 +385,68 @@ jobs:
           set -euo pipefail
 
           GRADLE_FILE="app/build.gradle"
-          AIDL_FILE="app/src/main/aidl/net/typeblog/socks/IVpnService.aidl"
 
-          test -f "$GRADLE_FILE"
-          test -f "$AIDL_FILE"
+          if [[ ! -f "$GRADLE_FILE" ]]; then
+            GRADLE_FILE="app/build.gradle.kts"
+          fi
 
-          grep -q "namespace 'net.typeblog.socks'" "$GRADLE_FILE"
-          grep -q "buildConfig true" "$GRADLE_FILE"
-          grep -q "aidl true" "$GRADLE_FILE"
-          grep -q "compileSdkVersion 36" "$GRADLE_FILE"
-          grep -q "targetSdkVersion 36" "$GRADLE_FILE"
+          echo "Checking: $GRADLE_FILE"
 
-          echo "All required Android settings are enabled."
-          echo "AIDL source:"
-          cat "$AIDL_FILE"
+          grep -nE 'namespace|buildFeatures|buildConfig|aidl|compileSdk|targetSdk' "$GRADLE_FILE" || true
 
-      # 8. دانلود Xray ARM64
-      - name: Download official Xray ARM64 core
+          grep -Eq 'buildConfig[[:space:]]*(=[[:space:]]*)?true' "$GRADLE_FILE" || {
+            echo "::error::BuildConfig is not enabled."
+            exit 1
+          }
+
+          grep -Eq 'aidl[[:space:]]*(=[[:space:]]*)?true' "$GRADLE_FILE" || {
+            echo "::error::AIDL is not enabled."
+            exit 1
+          }
+
+          grep -Eq 'compileSdk(Version)?[[:space:]]*(=)?[[:space:]]*36' "$GRADLE_FILE" || {
+            echo "::error::compileSdk 36 not detected."
+            exit 1
+          }
+
+          grep -Eq 'targetSdk(Version)?[[:space:]]*(=)?[[:space:]]*36' "$GRADLE_FILE" || {
+            echo "::error::targetSdk 36 not detected."
+            exit 1
+          }
+
+          AIDL_FILE="$(find app/src -type f -name IVpnService.aidl -print -quit)"
+
+          if [[ -z "$AIDL_FILE" ]]; then
+            echo "::error::IVpnService.aidl missing."
+            exit 1
+          fi
+
+          echo "AIDL found: $AIDL_FILE"
+          echo "Configuration verification passed."
+
+      # 8. دریافت Xray ARM64
+      - name: Download Xray ARM64
         shell: bash
         working-directory: ${{ steps.locate.outputs.project_dir }}
         run: |
           set -euo pipefail
 
           XRAY_VERSION="v26.11.9"
-
           XRAY_SHA256="edcefc25b9b3195b11e18624c8269a969d6aabc39c6298a9a5ab29de15d46f3b"
 
-          ARCHIVE="$RUNNER_TEMP/xray-android-arm64.zip"
+          ARCHIVE="$RUNNER_TEMP/xray-arm64.zip"
 
-          DOWNLOAD_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-android-arm64-v8a.zip"
+          URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-android-arm64-v8a.zip"
 
-          curl -fL \
-            --retry 3 \
-            --retry-delay 2 \
-            "$DOWNLOAD_URL" \
-            -o "$ARCHIVE"
+          curl -fL --retry 3 "$URL" -o "$ARCHIVE"
 
           echo "${XRAY_SHA256}  ${ARCHIVE}" | sha256sum --check -
 
-          mkdir -p "$RUNNER_TEMP/xray-core"
+          mkdir -p "$RUNNER_TEMP/xray-extract"
 
-          unzip -oq "$ARCHIVE" -d "$RUNNER_TEMP/xray-core"
+          unzip -oq "$ARCHIVE" -d "$RUNNER_TEMP/xray-extract"
 
-          XRAY_BIN="$(
-            find "$RUNNER_TEMP/xray-core" \
-              -type f \
-              -name xray \
-              -print -quit
-          )"
+          XRAY_BIN="$(find "$RUNNER_TEMP/xray-extract" -type f -name xray -print -quit)"
 
           if [[ -z "$XRAY_BIN" ]]; then
             echo "::error::Xray binary not found."
@@ -380,37 +454,27 @@ jobs:
           fi
 
           mkdir -p app/src/main/jniLibs/arm64-v8a
-          mkdir -p app/src/main/assets/xray
 
-          install -m 755 \
-            "$XRAY_BIN" \
+          install -m 755 "$XRAY_BIN" \
             app/src/main/jniLibs/arm64-v8a/libxray.so
-
-          curl -fL \
-            --retry 3 \
-            "https://raw.githubusercontent.com/XTLS/Xray-core/${XRAY_VERSION}/LICENSE" \
-            -o app/src/main/assets/xray/LICENSE
-
-          test -x app/src/main/jniLibs/arm64-v8a/libxray.so
 
           readelf -h app/src/main/jniLibs/arm64-v8a/libxray.so \
             | grep -Eq 'Machine:.*AArch64'
 
-          echo "Xray ARM64 installed successfully."
+          echo "Xray ARM64 installed."
 
-      # 9. نصب و بررسی Gradle
-      - name: Verify Gradle
+      # 9. بررسی Gradle
+      - name: Verify Gradle wrapper
         shell: bash
         working-directory: ${{ steps.locate.outputs.project_dir }}
         run: |
           set -euo pipefail
 
           chmod +x gradlew
-
           ./gradlew --version
 
-      # 10. تولید BuildConfig و کامپایل AIDL
-      - name: Generate BuildConfig and compile AIDL
+      # 10. تولید BuildConfig و AIDL
+      - name: Generate BuildConfig and AIDL
         shell: bash
         working-directory: ${{ steps.locate.outputs.project_dir }}
         run: |
@@ -422,30 +486,17 @@ jobs:
             :app:generateDebugBuildConfig \
             :app:compileDebugAidl
 
-          echo "Checking generated BuildConfig..."
+          echo "Checking generated files..."
 
-          BUILD_CONFIG="$(
-            find app/build \
-              -type f \
-              -name BuildConfig.java \
-              -print -quit
-          )"
+          BUILD_CONFIG="$(find app/build -type f -name BuildConfig.java -print -quit || true)"
+
+          AIDL_OUTPUT="$(find app/build -type f -name IVpnService.java -print -quit || true)"
 
           if [[ -z "$BUILD_CONFIG" ]]; then
             echo "::error::BuildConfig.java was not generated."
+            find app/build/generated -type f | head -100 || true
             exit 1
           fi
-
-          echo "BuildConfig generated: $BUILD_CONFIG"
-
-          echo "Checking generated AIDL..."
-
-          AIDL_OUTPUT="$(
-            find app/build \
-              -type f \
-              -name IVpnService.java \
-              -print -quit
-          )"
 
           if [[ -z "$AIDL_OUTPUT" ]]; then
             echo "::error::IVpnService.java was not generated."
@@ -453,10 +504,11 @@ jobs:
             exit 1
           fi
 
-          echo "AIDL generated: $AIDL_OUTPUT"
+          echo "BuildConfig: $BUILD_CONFIG"
+          echo "AIDL: $AIDL_OUTPUT"
 
       # 11. ساخت APK
-      - name: Build Debug and Release APK
+      - name: Build Debug and Release
         shell: bash
         working-directory: ${{ steps.locate.outputs.project_dir }}
         run: |
@@ -469,8 +521,8 @@ jobs:
             assembleDebug \
             assembleRelease
 
-      # 12. پیدا کردن APKها
-      - name: Find and verify APK outputs
+      # 12. یافتن APKها
+      - name: Find APK outputs
         id: apk
         shell: bash
         run: |
@@ -479,44 +531,19 @@ jobs:
           PROJECT_DIR="${{ steps.locate.outputs.project_dir }}"
           APK_ROOT="$PROJECT_DIR/app/build/outputs/apk"
 
-          echo "Searching in: $APK_ROOT"
+          echo "APK output directory: $APK_ROOT"
 
-          if [[ ! -d "$APK_ROOT" ]]; then
-            echo "::error::APK output directory not found."
+          DEBUG_APK="$(find "$APK_ROOT/debug" -type f -name '*.apk' -print -quit 2>/dev/null || true)"
+
+          RELEASE_APK="$(find "$APK_ROOT/release" -type f -name '*.apk' -print -quit 2>/dev/null || true)"
+
+          if [[ -z "$DEBUG_APK" || -z "$RELEASE_APK" ]]; then
+            echo "::error::APK output missing."
+            find "$APK_ROOT" -type f -print || true
             exit 1
           fi
 
-          DEBUG_APK="$(
-            find "$APK_ROOT/debug" \
-              -type f \
-              -name '*.apk' \
-              -print -quit 2>/dev/null || true
-          )"
-
-          RELEASE_APK="$(
-            find "$APK_ROOT/release" \
-              -type f \
-              -name '*.apk' \
-              -print -quit 2>/dev/null || true
-          )"
-
-          if [[ -z "$DEBUG_APK" ]]; then
-            echo "::error::Debug APK not found."
-            find "$APK_ROOT" -type f
-            exit 1
-          fi
-
-          if [[ -z "$RELEASE_APK" ]]; then
-            echo "::error::Release APK not found."
-            find "$APK_ROOT" -type f
-            exit 1
-          fi
-
-          echo "DEBUG APK:"
-          ls -lh "$DEBUG_APK"
-
-          echo "RELEASE APK:"
-          ls -lh "$RELEASE_APK"
+          ls -lh "$DEBUG_APK" "$RELEASE_APK"
 
           echo "debug_apk=$DEBUG_APK" >> "$GITHUB_OUTPUT"
           echo "release_apk=$RELEASE_APK" >> "$GITHUB_OUTPUT"
@@ -525,7 +552,7 @@ jobs:
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: Frago-1.4.7-ARM64-Debug
+          name: Frago-ARM64-Debug
           path: ${{ steps.apk.outputs.debug_apk }}
           if-no-files-found: error
           retention-days: 14
@@ -534,7 +561,7 @@ jobs:
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: Frago-1.4.7-ARM64-Release
+          name: Frago-ARM64-Release
           path: ${{ steps.apk.outputs.release_apk }}
           if-no-files-found: error
           retention-days: 14
@@ -545,17 +572,14 @@ jobs:
         shell: bash
         run: |
           {
-            echo "## Frago 1.4.7 ARM64"
+            echo "## Frago ARM64 Build"
             echo ""
             echo "- Build: Successful"
             echo "- Architecture: ARM64-v8a"
             echo "- Java: 17"
             echo "- Android SDK: 36"
-            echo "- Android Gradle Plugin: 8.10.1"
-            echo "- Gradle: 8.11.1"
-            echo "- BuildConfig: Enabled"
-            echo "- AIDL: Enabled"
-            echo "- Xray: v26.11.9"
-            echo "- Debug APK: Uploaded"
-            echo "- Release APK: Uploaded"
+            echo "- BuildConfig: enabled"
+            echo "- AIDL: enabled"
+            echo "- Debug APK: uploaded"
+            echo "- Release APK: uploaded"
           } >> "$GITHUB_STEP_SUMMARY"
