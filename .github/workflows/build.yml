@@ -1,10 +1,12 @@
 
-name: Build Frago ARM64 APK
+name: Build Frago 1.4.7 ARM64 APK
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
 
 permissions:
   contents: read
@@ -17,29 +19,32 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Locate or extract Frago Android project
+      # Find project directly or extract source ZIP
+      - name: Locate Frago project
         id: locate
         shell: bash
         run: |
           set -euo pipefail
 
           find_project() {
-            local search_root="$1"
-            local wrapper project_dir
+            local root="$1"
+            local wrapper dir
 
             while IFS= read -r -d '' wrapper; do
-              project_dir="$(dirname "$wrapper")"
+              dir="$(dirname "$wrapper")"
 
-              if [[ -f "$project_dir/settings.gradle" || -f "$project_dir/settings.gradle.kts" ]]; then
-                if [[ -f "$project_dir/app/build.gradle" || -f "$project_dir/app/build.gradle.kts" ]]; then
-                  printf '%s\n' "$project_dir"
+              if [[ -f "$dir/settings.gradle" || -f "$dir/settings.gradle.kts" ]]; then
+                if [[ -f "$dir/app/build.gradle" || -f "$dir/app/build.gradle.kts" ]]; then
+                  echo "$dir"
                   return 0
                 fi
               fi
-            done < <(find "$search_root" -type f -name gradlew \
-              -not -path '*/.git/*' \
-              -not -path '*/.gradle/*' \
-              -not -path '*/build/*' -print0)
+            done < <(
+              find "$root" -type f -name gradlew \
+                -not -path '*/.git/*' \
+                -not -path '*/build/*' \
+                -print0
+            )
 
             return 1
           }
@@ -47,89 +52,228 @@ jobs:
           PROJECT_DIR="$(find_project "$GITHUB_WORKSPACE" || true)"
 
           if [[ -z "$PROJECT_DIR" ]]; then
-            echo "Searching for source ZIP..."
+            echo "Searching source ZIP..."
 
             EXTRACT_BASE="$GITHUB_WORKSPACE/.frago-extracted"
             mkdir -p "$EXTRACT_BASE"
 
-            found=false
-            archive_index=0
+            index=0
 
             while IFS= read -r -d '' archive; do
-              archive_index=$((archive_index + 1))
-              extract_dir="$EXTRACT_BASE/archive-$archive_index"
+              index=$((index + 1))
+              extract_dir="$EXTRACT_BASE/archive-$index"
 
               mkdir -p "$extract_dir"
 
               echo "Extracting: $archive"
 
-              if ! unzip -qq "$archive" -d "$extract_dir"; then
-                continue
-              fi
+              unzip -oq "$archive" -d "$extract_dir"
 
               PROJECT_DIR="$(find_project "$extract_dir" || true)"
 
               if [[ -n "$PROJECT_DIR" ]]; then
-                found=true
                 break
               fi
 
-            done < <(find "$GITHUB_WORKSPACE" -maxdepth 4 -type f -iname '*.zip' \
-              -not -path '*/.git/*' \
-              -not -path '*/.frago-extracted/*' -print0)
+            done < <(
+              find "$GITHUB_WORKSPACE" \
+                -maxdepth 4 \
+                -type f \
+                -iname '*.zip' \
+                -not -path '*/.git/*' \
+                -not -path '*/.frago-extracted/*' \
+                -print0
+            )
+          fi
 
-            if [[ "$found" != true ]]; then
-              echo "ERROR: Android project not found!"
-              find "$GITHUB_WORKSPACE" -maxdepth 3 -type f | sort
-              exit 1
-            fi
+          if [[ -z "$PROJECT_DIR" ]]; then
+            echo "ERROR: Frago project not found"
+            exit 1
           fi
 
           PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
 
-          test -f "$PROJECT_DIR/gradlew"
-          test -f "$PROJECT_DIR/settings.gradle" -o -f "$PROJECT_DIR/settings.gradle.kts"
-          test -f "$PROJECT_DIR/app/build.gradle" -o -f "$PROJECT_DIR/app/build.gradle.kts"
-
           chmod +x "$PROJECT_DIR/gradlew"
 
-          echo "Found project: $PROJECT_DIR"
+          echo "Project: $PROJECT_DIR"
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Java 17
+      # Java 17
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
+      # Android SDK
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK
+      - name: Install Android SDK 36
         shell: bash
         run: |
           set -euo pipefail
 
-          sdkmanager "platforms;android-36" \
+          sdkmanager \
+            "platforms;android-36" \
             "build-tools;36.0.0" \
             "platform-tools"
 
-      - name: Verify environment
+      # Upgrade old Gradle and Android Gradle Plugin
+      - name: Upgrade Android build system
+        working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
-          java -version
-          echo "JAVA_HOME=$JAVA_HOME"
-          echo "Project: ${{ steps.locate.outputs.project_dir }}"
+          set -euo pipefail
 
-          test -x "${{ steps.locate.outputs.project_dir }}/gradlew"
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
 
-      - name: Download Xray Android ARM64 core
-        shell: bash
+          # Root Gradle configuration
+          root = Path("build.gradle")
+
+          content = root.read_text(encoding="utf-8")
+
+          content = re.sub(
+              r"classpath\s+['\"]com\.android\.tools\.build:gradle:[^'\"]+['\"]",
+              "classpath 'com.android.tools.build:gradle:8.10.1'",
+              content
+          )
+
+          root.write_text(content, encoding="utf-8")
+
+          # Gradle wrapper
+          wrapper = Path("gradle/wrapper/gradle-wrapper.properties")
+
+          content = wrapper.read_text(encoding="utf-8")
+
+          content = re.sub(
+              r"distributionUrl=.*",
+              "distributionUrl=https\\://services.gradle.org/distributions/gradle-8.11.1-all.zip",
+              content
+          )
+
+          wrapper.write_text(content, encoding="utf-8")
+
+          # Android app module
+          app = Path("app/build.gradle")
+
+          content = app.read_text(encoding="utf-8")
+
+          if not re.search(r"\bnamespace\s+", content):
+              content = re.sub(
+                  r"android\s*\{",
+                  'android {\n    namespace "net.typeblog.socks"',
+                  content,
+                  count=1
+              )
+
+          # Modern Android SDK
+          content = re.sub(
+              r"compileSdkVersion\s+\d+",
+              "compileSdk 36",
+              content
+          )
+
+          content = re.sub(
+              r"compileSdk\s+\d+",
+              "compileSdk 36",
+              content
+          )
+
+          content = re.sub(
+              r"targetSdkVersion\s+\d+",
+              "targetSdk 36",
+              content
+          )
+
+          content = re.sub(
+              r"targetSdk\s+\d+",
+              "targetSdk 36",
+              content
+          )
+
+          # Generate BuildConfig and AIDL classes
+          if not re.search(r"buildFeatures\s*\{", content):
+              content = re.sub(
+                  r"android\s*\{",
+                  """android {
+              buildFeatures {
+                  buildConfig true
+                  aidl true
+              }
+          """,
+                  content,
+                  count=1
+              )
+          else:
+              match = re.search(
+                  r"buildFeatures\s*\{([^}]*)\}",
+                  content,
+                  re.DOTALL
+              )
+
+              if match:
+                  features = match.group(1)
+
+                  if not re.search(r"\bbuildConfig\s+", features):
+                      features += "\n        buildConfig true"
+
+                  if not re.search(r"\baidl\s+", features):
+                      features += "\n        aidl true"
+
+                  content = (
+                      content[:match.start(1)]
+                      + features
+                      + content[match.end(1):]
+                  )
+
+          # App version
+          content = re.sub(
+              r"versionCode\s+\d+",
+              "versionCode 26",
+              content
+          )
+
+          content = re.sub(
+              r'versionName\s+"[^"]+"',
+              'versionName "1.4.7-frago"',
+              content
+          )
+
+          app.write_text(content, encoding="utf-8")
+
+          print("Android build configuration updated.")
+          print(content)
+          PY
+
+      # Check generated code configuration
+      - name: Verify AIDL and BuildConfig
         working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f app/src/main/aidl/net/typeblog/socks/IVpnService.aidl
+
+          grep -q 'namespace "net.typeblog.socks"' app/build.gradle
+          grep -q 'buildConfig true' app/build.gradle
+          grep -q 'aidl true' app/build.gradle
+
+          echo "AIDL source found."
+          echo "BuildConfig enabled."
+          echo "AIDL generation enabled."
+
+      # Download official Xray ARM64 core
+      - name: Download Xray ARM64
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
         run: |
           set -euo pipefail
 
           XRAY_VERSION="v26.11.9"
+
           XRAY_SHA256="edcefc25b9b3195b11e18624c8269a969d6aabc39c6298a9a5ab29de15d46f3b"
 
           ARCHIVE="$RUNNER_TEMP/xray-android-arm64.zip"
@@ -154,39 +298,62 @@ jobs:
           install -m 755 "$XRAY_BIN" \
             app/src/main/jniLibs/arm64-v8a/libxray.so
 
-          curl -fL \
+          curl -fL --retry 3 \
             "https://raw.githubusercontent.com/XTLS/Xray-core/${XRAY_VERSION}/LICENSE" \
             -o app/src/main/assets/xray/LICENSE
-
-          test -x app/src/main/jniLibs/arm64-v8a/libxray.so
 
           readelf -h app/src/main/jniLibs/arm64-v8a/libxray.so \
             | grep -Eq 'Machine:.*AArch64'
 
-          file app/src/main/jniLibs/arm64-v8a/libxray.so
+          echo "Xray ARM64 installed successfully."
 
-      - name: Build Frago APKs
-        shell: bash
+      # Build APK
+      - name: Build Frago APK
         working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
         run: |
           set -euo pipefail
 
           chmod +x ./gradlew
 
-          ./gradlew --no-daemon clean assembleDebug assembleRelease
+          java -version
 
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            clean \
+            assembleDebug \
+            assembleRelease
+
+      # Verify APK
+      - name: Verify APK outputs
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DEBUG_APK="app/build/outputs/apk/debug/app-debug.apk"
+          RELEASE_APK="app/build/outputs/apk/release/app-release.apk"
+
+          test -f "$DEBUG_APK"
+          test -f "$RELEASE_APK"
+
+          ls -lh "$DEBUG_APK" "$RELEASE_APK"
+
+      # Upload Debug APK
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: Frago-ARM64-debug
+          name: Frago-1.4.7-ARM64-Debug
           path: ${{ steps.locate.outputs.project_dir }}/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
 
+      # Upload Release APK
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: Frago-ARM64-release
+          name: Frago-1.4.7-ARM64-Release
           path: ${{ steps.locate.outputs.project_dir }}/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 14
