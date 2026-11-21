@@ -9,7 +9,7 @@ on:
       - master
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -155,7 +155,6 @@ jobs:
 
           source = file.read_text(encoding="utf-8")
 
-          # Find actual AIDL file
           aidl_files = list((app / "src").rglob("IVpnService.aidl"))
 
           if not aidl_files:
@@ -180,7 +179,6 @@ jobs:
 
           print("AIDL package:", package)
 
-          # Find Java/Kotlin package references
           package_dirs = list((app / "src" / "main").rglob("*.java"))
 
           if not package_dirs:
@@ -210,55 +208,23 @@ jobs:
 
           print("Selected namespace:", namespace)
 
-          # Ensure android block exists
           android_match = re.search(r"\bandroid\s*\{", source)
 
           if not android_match:
               sys.exit("ERROR: android block not found")
 
-          def insert_into_block(text, block_name, lines):
-              pattern = re.search(
-                  rf"\b{re.escape(block_name)}\s*\{{",
-                  text
-              )
-
-              if not pattern:
-                  return None
-
-              start = pattern.end()
-              depth = 1
-              pos = start
-
-              while pos < len(text) and depth:
-                  if text[pos] == "{":
-                      depth += 1
-                  elif text[pos] == "}":
-                      depth -= 1
-                  pos += 1
-
-              if depth != 0:
-                  sys.exit(f"ERROR: invalid {block_name} block")
-
-              block = text[pattern.start():pos]
-
-              for key, line in lines.items():
-                  if not re.search(rf"\b{re.escape(key)}\b", block):
-                      block = block[:-1] + "\n    " + line + "\n}"
-
-              return text[:pattern.start()] + block + text[pos:]
-
-          # Namespace
           if kotlin:
               namespace_line = f'namespace = "{namespace}"'
           else:
               namespace_line = f"namespace '{namespace}'"
 
           if not re.search(r"\bnamespace\b", source):
-              source = source[:android_match.end()] + \
-                  "\n    " + namespace_line + "\n" + \
-                  source[android_match.end():]
+              source = (
+                  source[:android_match.end()]
+                  + "\n    " + namespace_line + "\n"
+                  + source[android_match.end():]
+              )
 
-          # Build features
           build_features = re.search(r"\bbuildFeatures\s*\{", source)
 
           if not build_features:
@@ -313,7 +279,6 @@ jobs:
 
               source = source[:build_features.start()] + block + source[pos:]
 
-          # Compile SDK
           if re.search(r"\bcompileSdkVersion\s*\(?\s*\d+", source):
               source = re.sub(
                   r"\bcompileSdkVersion\s*\(?\s*\d+\)?",
@@ -331,10 +296,12 @@ jobs:
           else:
               android_match = re.search(r"\bandroid\s*\{", source)
               line = "compileSdk = 36" if kotlin else "compileSdk 36"
-              source = source[:android_match.end()] + \
-                  "\n    " + line + "\n" + source[android_match.end():]
+              source = (
+                  source[:android_match.end()]
+                  + "\n    " + line + "\n"
+                  + source[android_match.end():]
+              )
 
-          # Target SDK
           if re.search(r"\btargetSdkVersion\s*\(?\s*\d+", source):
               source = re.sub(
                   r"\btargetSdkVersion\s*\(?\s*\d+\)?",
@@ -357,9 +324,11 @@ jobs:
 
               line = "targetSdk = 36" if kotlin else "targetSdk 36"
 
-              source = source[:default_config.end()] + \
-                  "\n        " + line + "\n" + \
-                  source[default_config.end():]
+              source = (
+                  source[:default_config.end()]
+                  + "\n        " + line + "\n"
+                  + source[default_config.end():]
+              )
 
           file.write_text(source, encoding="utf-8")
 
@@ -377,7 +346,7 @@ jobs:
           echo "========== AIDL =========="
           find app/src -type f -name '*.aidl' -print
 
-      # 7. تشخیص تنظیمات بدون توقف مبهم
+      # 7. بررسی تنظیمات
       - name: Verify Android configuration
         shell: bash
         working-directory: ${{ steps.locate.outputs.project_dir }}
@@ -521,7 +490,7 @@ jobs:
             assembleDebug \
             assembleRelease
 
-      # 12. یافتن APKها
+      # 12. پیدا کردن APKها
       - name: Find APK outputs
         id: apk
         shell: bash
@@ -548,25 +517,118 @@ jobs:
           echo "debug_apk=$DEBUG_APK" >> "$GITHUB_OUTPUT"
           echo "release_apk=$RELEASE_APK" >> "$GITHUB_OUTPUT"
 
-      # 13. آپلود Debug
+      # 13. بررسی سلامت APK و آماده‌سازی فایل‌ها
+      - name: Validate and Prepare APK Files
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="$RUNNER_TEMP/frago-release"
+          mkdir -p "$OUT"
+
+          DEBUG_APK="${{ steps.apk.outputs.debug_apk }}"
+          RELEASE_APK="${{ steps.apk.outputs.release_apk }}"
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" \
+            -type f -name apksigner -print | sort -V | tail -n 1)"
+
+          if [[ -z "$APKSIGNER" || ! -x "$APKSIGNER" ]]; then
+            echo "::error::apksigner not found."
+            exit 1
+          fi
+
+          validate_apk() {
+            local apk="$1"
+            local name="$2"
+            local listing="$RUNNER_TEMP/${name}.contents.txt"
+
+            echo "Checking $name"
+
+            if [[ ! -s "$apk" ]]; then
+              echo "::error::APK is empty or missing: $apk"
+              exit 1
+            fi
+
+            unzip -t "$apk"
+
+            unzip -Z1 "$apk" > "$listing"
+
+            if ! grep -Fxq "lib/arm64-v8a/libxray.so" "$listing"; then
+              echo "::error::ARM64 Xray library missing in $name"
+              echo "APK contents:"
+              cat "$listing"
+              exit 1
+            fi
+
+            echo "$name passed ZIP and ARM64 checks."
+          }
+
+          validate_apk "$DEBUG_APK" "Debug"
+          validate_apk "$RELEASE_APK" "Release"
+
+          # Debug APK باید امضای معتبر داشته باشد.
+          "$APKSIGNER" verify --verbose "$DEBUG_APK"
+
+          cp "$DEBUG_APK" "$OUT/Frago-ARM64-Debug.apk"
+
+          # تشخیص امضاشده یا بدون امضای Release
+          if "$APKSIGNER" verify --verbose "$RELEASE_APK" >/dev/null 2>&1; then
+            cp "$RELEASE_APK" "$OUT/Frago-ARM64-Release.apk"
+            echo "Release APK is signed."
+          else
+            cp "$RELEASE_APK" "$OUT/Frago-ARM64-Release-unsigned.apk"
+            echo "Release APK is unsigned."
+          fi
+
+          echo "Prepared APK files:"
+          ls -lh "$OUT"
+
+          echo "output_dir=$OUT" >> "$GITHUB_OUTPUT"
+
+      # 14. آپلود Debug در Actions
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: Frago-ARM64-Debug
-          path: ${{ steps.apk.outputs.debug_apk }}
+          path: ${{ steps.prepare.outputs.output_dir }}/Frago-ARM64-Debug.apk
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14
 
-      # 14. آپلود Release
+      # 15. آپلود Release در Actions
       - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
           name: Frago-ARM64-Release
-          path: ${{ steps.apk.outputs.release_apk }}
+          path: ${{ steps.prepare.outputs.output_dir }}/Frago-ARM64-Release*.apk
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14
 
-      # 15. گزارش نهایی
+      # 16. انتشار مستقیم APK در GitHub Releases
+      - name: Publish Direct APK Downloads
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: frago-build-${{ github.run_id }}-${{ github.run_attempt }}
+          name: Frago ARM64 Build #${{ github.run_number }}
+          body: |
+            Frago Android ARM64 build.
+
+            Included files:
+            - Debug APK
+            - Release APK
+
+            Debug APK is verified with apksigner.
+            Release APK signing status is indicated in its filename.
+          files: |
+            ${{ steps.prepare.outputs.output_dir }}/Frago-ARM64-Debug.apk
+            ${{ steps.prepare.outputs.output_dir }}/Frago-ARM64-Release*.apk
+          fail_on_unmatched_files: true
+          prerelease: true
+          make_latest: false
+
+      # 17. گزارش نهایی
       - name: Build summary
         if: success()
         shell: bash
@@ -580,6 +642,10 @@ jobs:
             echo "- Android SDK: 36"
             echo "- BuildConfig: enabled"
             echo "- AIDL: enabled"
-            echo "- Debug APK: uploaded"
-            echo "- Release APK: uploaded"
+            echo "- APK integrity: checked"
+            echo "- Debug signature: verified"
+            echo "- Direct APK downloads: GitHub Releases"
+            echo ""
+            echo "### APK files"
+            ls -lh "$RUNNER_TEMP/frago-release"
           } >> "$GITHUB_STEP_SUMMARY"
