@@ -1,5 +1,4 @@
-
-name: Build Frago ARM64 APK
+name: Build Frago Android APK
 
 on:
   workflow_dispatch:
@@ -9,643 +8,110 @@ on:
       - master
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
-    name: Build Frago Android APK
-    runs-on: ubuntu-24.04
+    name: Build Frago APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
-      # 1. دریافت سورس
-      - name: Checkout repository
+      - name: Checkout source
         uses: actions/checkout@v4
 
-      # 2. پیدا کردن پروژه Gradle یا استخراج ZIP
-      - name: Locate Frago project
-        id: locate
+      - name: Detect and extract Android project
         shell: bash
         run: |
           set -euo pipefail
+          WORK="$GITHUB_WORKSPACE"
+          PROJECT=""
 
-          find_project() {
-            local root="$1"
-            local wrapper
-            local project
-
-            while IFS= read -r -d '' wrapper; do
-              project="$(dirname "$wrapper")"
-
-              if [[ -f "$project/settings.gradle" || -f "$project/settings.gradle.kts" ]]; then
-                if [[ -f "$project/app/build.gradle" || -f "$project/app/build.gradle.kts" ]]; then
-                  printf '%s\n' "$project"
-                  return 0
-                fi
-              fi
-            done < <(
-              find "$root" \
-                -type f -name gradlew \
-                -not -path '*/.git/*' \
-                -not -path '*/.gradle/*' \
-                -not -path '*/build/*' \
-                -print0
-            )
-
-            return 1
-          }
-
-          PROJECT_DIR="$(find_project "$GITHUB_WORKSPACE" || true)"
-
-          if [[ -z "$PROJECT_DIR" ]]; then
-            echo "Gradle project not found. Searching ZIP files..."
-
-            EXTRACT_BASE="$GITHUB_WORKSPACE/.frago-extracted"
-            mkdir -p "$EXTRACT_BASE"
-
-            INDEX=0
-            FOUND=false
-
-            while IFS= read -r -d '' ARCHIVE; do
-              INDEX=$((INDEX + 1))
-              DEST="$EXTRACT_BASE/archive-$INDEX"
-
-              mkdir -p "$DEST"
-
-              echo "Extracting $ARCHIVE"
-
-              if ! unzip -oq "$ARCHIVE" -d "$DEST"; then
-                continue
-              fi
-
-              PROJECT_DIR="$(find_project "$DEST" || true)"
-
-              if [[ -n "$PROJECT_DIR" ]]; then
-                FOUND=true
-                break
-              fi
-
-            done < <(
-              find "$GITHUB_WORKSPACE" \
-                -maxdepth 4 \
-                -type f -iname '*.zip' \
-                -not -path '*/.git/*' \
-                -not -path '*/.frago-extracted/*' \
-                -print0
-            )
-
-            if [[ "$FOUND" != true ]]; then
-              echo "::error::Frago Gradle project not found."
+          if [[ -f "$WORK/gradlew" && -f "$WORK/app/build.gradle" ]]; then
+            PROJECT="$WORK"
+          else
+            ZIP_FILE="$(find "$WORK" -maxdepth 5 -type f -iname '*.zip' -not -path '*/.git/*' | head -n 1 || true)"
+            if [[ -z "$ZIP_FILE" ]]; then
+              echo "ERROR: Android project or source ZIP not found"
               exit 1
             fi
+            mkdir -p "$WORK/frago-extracted"
+            unzip -q "$ZIP_FILE" -d "$WORK/frago-extracted"
+            PROJECT="$(find "$WORK/frago-extracted" -type f -name gradlew -print -quit | xargs -r dirname)"
           fi
 
-          PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
+          if [[ -z "$PROJECT" || ! -f "$PROJECT/app/build.gradle" ]]; then
+            echo "ERROR: Invalid Android Gradle project"
+            exit 1
+          fi
 
-          chmod +x "$PROJECT_DIR/gradlew"
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+          echo "Detected: $PROJECT"
 
-          echo "Project directory: $PROJECT_DIR"
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-
-      # 3. Java 17
-      - name: Set up Java 17
+      - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      # 4. Android SDK
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-
-      # 5. نصب SDK
-      - name: Install Android SDK components
+      - name: Install Android SDK 36 and NDK 28
         shell: bash
         run: |
           set -euo pipefail
-
-          sdkmanager \
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0" \
-            "platform-tools"
+            "ndk;28.2.13676358"
 
-      # 6. تشخیص AIDL و تنظیمات Gradle
-      - name: Configure Frago Android project
-        shell: bash
-        working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: |
-          set -euo pipefail
+          NDK="$ANDROID_SDK_ROOT/ndk/28.2.13676358"
+          test -x "$NDK/ndk-build"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
 
-          python3 <<'PY'
-          from pathlib import Path
-          import re
-          import sys
-
-          app = Path("app")
-          gradle = app / "build.gradle"
-          kotlin_gradle = app / "build.gradle.kts"
-
-          if gradle.exists():
-              file = gradle
-              kotlin = False
-          elif kotlin_gradle.exists():
-              file = kotlin_gradle
-              kotlin = True
-          else:
-              sys.exit("ERROR: app/build.gradle not found")
-
-          source = file.read_text(encoding="utf-8")
-
-          aidl_files = list((app / "src").rglob("IVpnService.aidl"))
-
-          if not aidl_files:
-              sys.exit("ERROR: IVpnService.aidl not found")
-
-          aidl = aidl_files[0]
-
-          print("AIDL file:", aidl)
-
-          aidl_text = aidl.read_text(encoding="utf-8")
-
-          package_match = re.search(
-              r"^\s*package\s+([A-Za-z0-9_.]+)\s*;",
-              aidl_text,
-              re.MULTILINE
-          )
-
-          if not package_match:
-              sys.exit("ERROR: AIDL package declaration not found")
-
-          package = package_match.group(1)
-
-          print("AIDL package:", package)
-
-          package_dirs = list((app / "src" / "main").rglob("*.java"))
-
-          if not package_dirs:
-              package_dirs = list((app / "src" / "main").rglob("*.kt"))
-
-          namespaces = []
-
-          for source_file in package_dirs:
-              text = source_file.read_text(
-                  encoding="utf-8",
-                  errors="ignore"
-              )
-
-              match = re.search(
-                  r"^\s*package\s+([A-Za-z0-9_.]+)",
-                  text,
-                  re.MULTILINE
-              )
-
-              if match:
-                  namespaces.append(match.group(1))
-
-          namespace = "net.typeblog.socks"
-
-          if package in namespaces:
-              namespace = package
-
-          print("Selected namespace:", namespace)
-
-          android_match = re.search(r"\bandroid\s*\{", source)
-
-          if not android_match:
-              sys.exit("ERROR: android block not found")
-
-          if kotlin:
-              namespace_line = f'namespace = "{namespace}"'
-          else:
-              namespace_line = f"namespace '{namespace}'"
-
-          if not re.search(r"\bnamespace\b", source):
-              source = (
-                  source[:android_match.end()]
-                  + "\n    " + namespace_line + "\n"
-                  + source[android_match.end():]
-              )
-
-          build_features = re.search(r"\bbuildFeatures\s*\{", source)
-
-          if not build_features:
-              android_match = re.search(r"\bandroid\s*\{", source)
-
-              if kotlin:
-                  block = """
-              buildFeatures {
-                  buildConfig = true
-                  aidl = true
-              }
-          """
-              else:
-                  block = """
-              buildFeatures {
-                  buildConfig true
-                  aidl true
-              }
-          """
-
-              source = (
-                  source[:android_match.end()]
-                  + block
-                  + source[android_match.end():]
-              )
-          else:
-              start = build_features.end()
-              depth = 1
-              pos = start
-
-              while pos < len(source) and depth:
-                  if source[pos] == "{":
-                      depth += 1
-                  elif source[pos] == "}":
-                      depth -= 1
-                  pos += 1
-
-              block = source[build_features.start():pos]
-
-              if kotlin:
-                  if not re.search(r"\bbuildConfig\s*=\s*true", block):
-                      block = block[:-1] + "\n    buildConfig = true\n}"
-
-                  if not re.search(r"\baidl\s*=\s*true", block):
-                      block = block[:-1] + "\n    aidl = true\n}"
-              else:
-                  if not re.search(r"\bbuildConfig\s+true", block):
-                      block = block[:-1] + "\n    buildConfig true\n}"
-
-                  if not re.search(r"\baidl\s+true", block):
-                      block = block[:-1] + "\n    aidl true\n}"
-
-              source = source[:build_features.start()] + block + source[pos:]
-
-          if re.search(r"\bcompileSdkVersion\s*\(?\s*\d+", source):
-              source = re.sub(
-                  r"\bcompileSdkVersion\s*\(?\s*\d+\)?",
-                  "compileSdkVersion 36",
-                  source,
-                  count=1
-              )
-          elif re.search(r"\bcompileSdk\s*=?\s*\d+", source):
-              source = re.sub(
-                  r"\bcompileSdk\s*=?\s*\d+",
-                  "compileSdk = 36" if kotlin else "compileSdk 36",
-                  source,
-                  count=1
-              )
-          else:
-              android_match = re.search(r"\bandroid\s*\{", source)
-              line = "compileSdk = 36" if kotlin else "compileSdk 36"
-              source = (
-                  source[:android_match.end()]
-                  + "\n    " + line + "\n"
-                  + source[android_match.end():]
-              )
-
-          if re.search(r"\btargetSdkVersion\s*\(?\s*\d+", source):
-              source = re.sub(
-                  r"\btargetSdkVersion\s*\(?\s*\d+\)?",
-                  "targetSdkVersion 36",
-                  source,
-                  count=1
-              )
-          elif re.search(r"\btargetSdk\s*=?\s*\d+", source):
-              source = re.sub(
-                  r"\btargetSdk\s*=?\s*\d+",
-                  "targetSdk = 36" if kotlin else "targetSdk 36",
-                  source,
-                  count=1
-              )
-          else:
-              default_config = re.search(r"\bdefaultConfig\s*\{", source)
-
-              if not default_config:
-                  sys.exit("ERROR: defaultConfig block not found")
-
-              line = "targetSdk = 36" if kotlin else "targetSdk 36"
-
-              source = (
-                  source[:default_config.end()]
-                  + "\n        " + line + "\n"
-                  + source[default_config.end():]
-              )
-
-          file.write_text(source, encoding="utf-8")
-
-          print("Gradle configuration updated.")
-          print("Namespace:", namespace)
-          print("BuildConfig: enabled")
-          print("AIDL: enabled")
-          print("compileSdk: 36")
-          print("targetSdk: 36")
-          PY
-
-          echo "========== FINAL GRADLE =========="
-          cat app/build.gradle 2>/dev/null || cat app/build.gradle.kts
-
-          echo "========== AIDL =========="
-          find app/src -type f -name '*.aidl' -print
-
-      # 7. بررسی تنظیمات
-      - name: Verify Android configuration
-        shell: bash
-        working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: |
-          set -euo pipefail
-
-          GRADLE_FILE="app/build.gradle"
-
-          if [[ ! -f "$GRADLE_FILE" ]]; then
-            GRADLE_FILE="app/build.gradle.kts"
-          fi
-
-          echo "Checking: $GRADLE_FILE"
-
-          grep -nE 'namespace|buildFeatures|buildConfig|aidl|compileSdk|targetSdk' "$GRADLE_FILE" || true
-
-          grep -Eq 'buildConfig[[:space:]]*(=[[:space:]]*)?true' "$GRADLE_FILE" || {
-            echo "::error::BuildConfig is not enabled."
-            exit 1
-          }
-
-          grep -Eq 'aidl[[:space:]]*(=[[:space:]]*)?true' "$GRADLE_FILE" || {
-            echo "::error::AIDL is not enabled."
-            exit 1
-          }
-
-          grep -Eq 'compileSdk(Version)?[[:space:]]*(=)?[[:space:]]*36' "$GRADLE_FILE" || {
-            echo "::error::compileSdk 36 not detected."
-            exit 1
-          }
-
-          grep -Eq 'targetSdk(Version)?[[:space:]]*(=)?[[:space:]]*36' "$GRADLE_FILE" || {
-            echo "::error::targetSdk 36 not detected."
-            exit 1
-          }
-
-          AIDL_FILE="$(find app/src -type f -name IVpnService.aidl -print -quit)"
-
-          if [[ -z "$AIDL_FILE" ]]; then
-            echo "::error::IVpnService.aidl missing."
-            exit 1
-          fi
-
-          echo "AIDL found: $AIDL_FILE"
-          echo "Configuration verification passed."
-
-      # 8. دریافت Xray ARM64
-      - name: Download Xray ARM64
-        shell: bash
-        working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: |
-          set -euo pipefail
-
-          XRAY_VERSION="v26.11.9"
-          XRAY_SHA256="edcefc25b9b3195b11e18624c8269a969d6aabc39c6298a9a5ab29de15d46f3b"
-
-          ARCHIVE="$RUNNER_TEMP/xray-arm64.zip"
-
-          URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-android-arm64-v8a.zip"
-
-          curl -fL --retry 3 "$URL" -o "$ARCHIVE"
-
-          echo "${XRAY_SHA256}  ${ARCHIVE}" | sha256sum --check -
-
-          mkdir -p "$RUNNER_TEMP/xray-extract"
-
-          unzip -oq "$ARCHIVE" -d "$RUNNER_TEMP/xray-extract"
-
-          XRAY_BIN="$(find "$RUNNER_TEMP/xray-extract" -type f -name xray -print -quit)"
-
-          if [[ -z "$XRAY_BIN" ]]; then
-            echo "::error::Xray binary not found."
-            exit 1
-          fi
-
-          mkdir -p app/src/main/jniLibs/arm64-v8a
-
-          install -m 755 "$XRAY_BIN" \
-            app/src/main/jniLibs/arm64-v8a/libxray.so
-
-          readelf -h app/src/main/jniLibs/arm64-v8a/libxray.so \
-            | grep -Eq 'Machine:.*AArch64'
-
-          echo "Xray ARM64 installed."
-
-      # 9. بررسی Gradle
-      - name: Verify Gradle wrapper
-        shell: bash
-        working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: |
-          set -euo pipefail
-
-          chmod +x gradlew
-          ./gradlew --version
-
-      # 10. تولید BuildConfig و AIDL
-      - name: Generate BuildConfig and AIDL
-        shell: bash
-        working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: |
-          set -euo pipefail
-
-          ./gradlew \
-            --no-daemon \
-            --stacktrace \
-            :app:generateDebugBuildConfig \
-            :app:compileDebugAidl
-
-          echo "Checking generated files..."
-
-          BUILD_CONFIG="$(find app/build -type f -name BuildConfig.java -print -quit || true)"
-
-          AIDL_OUTPUT="$(find app/build -type f -name IVpnService.java -print -quit || true)"
-
-          if [[ -z "$BUILD_CONFIG" ]]; then
-            echo "::error::BuildConfig.java was not generated."
-            find app/build/generated -type f | head -100 || true
-            exit 1
-          fi
-
-          if [[ -z "$AIDL_OUTPUT" ]]; then
-            echo "::error::IVpnService.java was not generated."
-            find app/build/generated -type f | head -100 || true
-            exit 1
-          fi
-
-          echo "BuildConfig: $BUILD_CONFIG"
-          echo "AIDL: $AIDL_OUTPUT"
-
-      # 11. ساخت APK
-      - name: Build Debug and Release
-        shell: bash
-        working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: |
-          set -euo pipefail
-
-          ./gradlew \
-            --no-daemon \
-            --stacktrace \
-            clean \
-            assembleDebug \
-            assembleRelease
-
-      # 12. پیدا کردن APKها
-      - name: Find APK outputs
-        id: apk
+      - name: Validate Frago source
         shell: bash
         run: |
           set -euo pipefail
+          cd "$PROJECT_DIR"
+          chmod +x gradlew app/src/main/build-byedpi.sh
+          test -f settings.gradle
+          test -f gradle/wrapper/gradle-wrapper.properties
+          test -f app/src/main/AndroidManifest.xml
+          grep -q 'gradle-8.13' gradle/wrapper/gradle-wrapper.properties
+          grep -q 'compileSdk 36' app/build.gradle
+          java -version
 
-          PROJECT_DIR="${{ steps.locate.outputs.project_dir }}"
-          APK_ROOT="$PROJECT_DIR/app/build/outputs/apk"
-
-          echo "APK output directory: $APK_ROOT"
-
-          DEBUG_APK="$(find "$APK_ROOT/debug" -type f -name '*.apk' -print -quit 2>/dev/null || true)"
-
-          RELEASE_APK="$(find "$APK_ROOT/release" -type f -name '*.apk' -print -quit 2>/dev/null || true)"
-
-          if [[ -z "$DEBUG_APK" || -z "$RELEASE_APK" ]]; then
-            echo "::error::APK output missing."
-            find "$APK_ROOT" -type f -print || true
-            exit 1
-          fi
-
-          ls -lh "$DEBUG_APK" "$RELEASE_APK"
-
-          echo "debug_apk=$DEBUG_APK" >> "$GITHUB_OUTPUT"
-          echo "release_apk=$RELEASE_APK" >> "$GITHUB_OUTPUT"
-
-      # 13. بررسی سلامت APK و آماده‌سازی فایل‌ها
-      - name: Validate and Prepare APK Files
-        id: prepare
+      - name: Build Frago Debug APK
         shell: bash
         run: |
           set -euo pipefail
+          cd "$PROJECT_DIR"
+          export ANDROID_NDK_HOME
+          export ANDROID_NDK_ROOT
+          ./gradlew --no-daemon --stacktrace clean assembleDebug
 
-          OUT="$RUNNER_TEMP/frago-release"
-          mkdir -p "$OUT"
-
-          DEBUG_APK="${{ steps.apk.outputs.debug_apk }}"
-          RELEASE_APK="${{ steps.apk.outputs.release_apk }}"
-
-          APKSIGNER="$(find "$ANDROID_HOME/build-tools" \
-            -type f -name apksigner -print | sort -V | tail -n 1)"
-
-          if [[ -z "$APKSIGNER" || ! -x "$APKSIGNER" ]]; then
-            echo "::error::apksigner not found."
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          if [[ ! -s "$APK" ]]; then
+            echo "ERROR: APK not generated"
+            find "$PROJECT_DIR/app/build/outputs" -type f -name '*.apk' || true
             exit 1
           fi
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp "$APK" "$GITHUB_WORKSPACE/output/Frago-v56-SNI-Spoof-Ping.apk"
+          ls -lh "$GITHUB_WORKSPACE/output/Frago-v56-SNI-Spoof-Ping.apk"
+          sha256sum "$GITHUB_WORKSPACE/output/Frago-v56-SNI-Spoof-Ping.apk"
 
-          validate_apk() {
-            local apk="$1"
-            local name="$2"
-            local listing="$RUNNER_TEMP/${name}.contents.txt"
-
-            echo "Checking $name"
-
-            if [[ ! -s "$apk" ]]; then
-              echo "::error::APK is empty or missing: $apk"
-              exit 1
-            fi
-
-            unzip -t "$apk"
-
-            unzip -Z1 "$apk" > "$listing"
-
-            if ! grep -Fxq "lib/arm64-v8a/libxray.so" "$listing"; then
-              echo "::error::ARM64 Xray library missing in $name"
-              echo "APK contents:"
-              cat "$listing"
-              exit 1
-            fi
-
-            echo "$name passed ZIP and ARM64 checks."
-          }
-
-          validate_apk "$DEBUG_APK" "Debug"
-          validate_apk "$RELEASE_APK" "Release"
-
-          # Debug APK باید امضای معتبر داشته باشد.
-          "$APKSIGNER" verify --verbose "$DEBUG_APK"
-
-          cp "$DEBUG_APK" "$OUT/Frago-ARM64-Debug.apk"
-
-          # تشخیص امضاشده یا بدون امضای Release
-          if "$APKSIGNER" verify --verbose "$RELEASE_APK" >/dev/null 2>&1; then
-            cp "$RELEASE_APK" "$OUT/Frago-ARM64-Release.apk"
-            echo "Release APK is signed."
-          else
-            cp "$RELEASE_APK" "$OUT/Frago-ARM64-Release-unsigned.apk"
-            echo "Release APK is unsigned."
-          fi
-
-          echo "Prepared APK files:"
-          ls -lh "$OUT"
-
-          echo "output_dir=$OUT" >> "$GITHUB_OUTPUT"
-
-      # 14. آپلود Debug در Actions
-      - name: Upload Debug APK
+      - name: Upload Frago APK
         uses: actions/upload-artifact@v4
         with:
-          name: Frago-ARM64-Debug
-          path: ${{ steps.prepare.outputs.output_dir }}/Frago-ARM64-Debug.apk
+          name: Frago-v56-SNI-Spoof-Ping-APK
+          path: output/Frago-v56-SNI-Spoof-Ping.apk
           if-no-files-found: error
-          compression-level: 0
           retention-days: 14
-
-      # 15. آپلود Release در Actions
-      - name: Upload Release APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: Frago-ARM64-Release
-          path: ${{ steps.prepare.outputs.output_dir }}/Frago-ARM64-Release*.apk
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 14
-
-      # 16. انتشار مستقیم APK در GitHub Releases
-      - name: Publish Direct APK Downloads
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: frago-build-${{ github.run_id }}-${{ github.run_attempt }}
-          name: Frago ARM64 Build #${{ github.run_number }}
-          body: |
-            Frago Android ARM64 build.
-
-            Included files:
-            - Debug APK
-            - Release APK
-
-            Debug APK is verified with apksigner.
-            Release APK signing status is indicated in its filename.
-          files: |
-            ${{ steps.prepare.outputs.output_dir }}/Frago-ARM64-Debug.apk
-            ${{ steps.prepare.outputs.output_dir }}/Frago-ARM64-Release*.apk
-          fail_on_unmatched_files: true
-          prerelease: true
-          make_latest: false
-
-      # 17. گزارش نهایی
-      - name: Build summary
-        if: success()
-        shell: bash
-        run: |
-          {
-            echo "## Frago ARM64 Build"
-            echo ""
-            echo "- Build: Successful"
-            echo "- Architecture: ARM64-v8a"
-            echo "- Java: 17"
-            echo "- Android SDK: 36"
-            echo "- BuildConfig: enabled"
-            echo "- AIDL: enabled"
-            echo "- APK integrity: checked"
-            echo "- Debug signature: verified"
-            echo "- Direct APK downloads: GitHub Releases"
-            echo ""
-            echo "### APK files"
-            ls -lh "$RUNNER_TEMP/frago-release"
-          } >> "$GITHUB_STEP_SUMMARY"
