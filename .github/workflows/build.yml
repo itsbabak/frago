@@ -27,8 +27,13 @@ jobs:
           WORK="$GITHUB_WORKSPACE"
           PROJECT=""
 
+          echo "=== Repository Tree ==="
+          find "$WORK" -maxdepth 4 -not -path '*/.git*'
+
           if [[ -f "$WORK/gradlew" && -f "$WORK/app/src/main/build-byedpi.sh" ]]; then
             PROJECT="$WORK"
+          elif [[ -f "$WORK/Frago/gradlew" && -f "$WORK/Frago/app/src/main/build-byedpi.sh" ]]; then
+            PROJECT="$WORK/Frago"
           else
             mkdir -p "$WORK/frago-extracted"
             while IFS= read -r -d '' zipf; do
@@ -41,7 +46,7 @@ jobs:
                 PROJECT="$(dirname "$(dirname "$(dirname "$FOUND")")")"
                 break
               fi
-            done < <(find "$WORK" -maxdepth 5 -type f -iname '*WhiteDNS*.zip' -o -iname '*.zip' -not -path '*/.git/*' -print0)
+            done < <(find "$WORK" -not -path '*/.git/*' -type f -iname '*.zip' -print0)
           fi
 
           if [[ -z "$PROJECT" || ! -f "$PROJECT/app/build.gradle" ]]; then
