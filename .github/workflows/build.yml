@@ -63,9 +63,11 @@ jobs:
 
       - name: Build native libraries (if needed)
         working-directory: ${{ steps.locate.outputs.project_dir }}/app/src/main
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
         run: |
+          NDK_DIR="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}/ndk/26.3.11579264"
+          export ANDROID_NDK_HOME="$NDK_DIR"
+          export PATH="$NDK_DIR:$PATH"
+          which ndk-build
           if [ -f build-jni.sh ]; then ./build-jni.sh; fi
           if [ -f build-byedpi.sh ]; then ./build-byedpi.sh; fi
 
