@@ -1,4 +1,4 @@
-name: Build Frago Android APK
+name: Build Frago WhiteDNS APK
 
 on:
   workflow_dispatch:
@@ -27,21 +27,25 @@ jobs:
           WORK="$GITHUB_WORKSPACE"
           PROJECT=""
 
-          if [[ -f "$WORK/gradlew" && -f "$WORK/app/build.gradle" ]]; then
+          if [[ -f "$WORK/gradlew" && -f "$WORK/app/src/main/build-byedpi.sh" ]]; then
             PROJECT="$WORK"
           else
-            ZIP_FILE="$(find "$WORK" -maxdepth 5 -type f -iname '*.zip' -not -path '*/.git/*' | head -n 1 || true)"
-            if [[ -z "$ZIP_FILE" ]]; then
-              echo "ERROR: Android project or source ZIP not found"
-              exit 1
-            fi
             mkdir -p "$WORK/frago-extracted"
-            unzip -q "$ZIP_FILE" -d "$WORK/frago-extracted"
-            PROJECT="$(find "$WORK/frago-extracted" -type f -name gradlew -print -quit | xargs -r dirname)"
+            while IFS= read -r -d '' zipf; do
+              echo "Checking archive: $zipf"
+              SUBDIR="$WORK/frago-extracted/$(basename "$zipf" .zip)"
+              mkdir -p "$SUBDIR"
+              unzip -q -o "$zipf" -d "$SUBDIR"
+              FOUND="$(find "$SUBDIR" -type f -path '*/app/src/main/build-byedpi.sh' -print -quit || true)"
+              if [[ -n "$FOUND" ]]; then
+                PROJECT="$(dirname "$(dirname "$(dirname "$FOUND")")")"
+                break
+              fi
+            done < <(find "$WORK" -maxdepth 5 -type f -iname '*WhiteDNS*.zip' -o -iname '*.zip' -not -path '*/.git/*' -print0)
           fi
 
           if [[ -z "$PROJECT" || ! -f "$PROJECT/app/build.gradle" ]]; then
-            echo "ERROR: Invalid Android Gradle project"
+            echo "ERROR: Frago project (with build-byedpi.sh) not found in repository!"
             exit 1
           fi
 
@@ -104,14 +108,14 @@ jobs:
             exit 1
           fi
           mkdir -p "$GITHUB_WORKSPACE/output"
-          cp "$APK" "$GITHUB_WORKSPACE/output/Frago-v56-SNI-Spoof-Ping.apk"
-          ls -lh "$GITHUB_WORKSPACE/output/Frago-v56-SNI-Spoof-Ping.apk"
-          sha256sum "$GITHUB_WORKSPACE/output/Frago-v56-SNI-Spoof-Ping.apk"
+          cp "$APK" "$GITHUB_WORKSPACE/output/Frago-v57-WhiteDNS.apk"
+          ls -lh "$GITHUB_WORKSPACE/output/Frago-v57-WhiteDNS.apk"
+          sha256sum "$GITHUB_WORKSPACE/output/Frago-v57-WhiteDNS.apk"
 
       - name: Upload Frago APK
         uses: actions/upload-artifact@v4
         with:
-          name: Frago-v56-SNI-Spoof-Ping-APK
-          path: output/Frago-v56-SNI-Spoof-Ping.apk
+          name: Frago-v57-WhiteDNS-APK
+          path: output/Frago-v57-WhiteDNS.apk
           if-no-files-found: error
           retention-days: 14
