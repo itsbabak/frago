@@ -15,7 +15,7 @@ jobs:
   build:
     name: Extract ZIP and Build Frago
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       # 1. دریافت مخزن
@@ -37,29 +37,24 @@ jobs:
 
           ZIP=""
 
-          if [[ -n "${SOURCE_ZIP:-}" && -f "${SOURCE_ZIP}" ]]; then
-            ZIP="$SOURCE_ZIP"
-          else
-            ZIP="$(find "$GITHUB_WORKSPACE" \
-              -maxdepth 3 \
-              -type f \
-              -iname '*.zip' \
-              -not -path '*/output/*' \
-              -printf '%T@\t%p\n' \
-              | sort -nr \
-              | head -n 1 \
-              | cut -f2- || true)"
-          fi
+          ZIP="$(find "$GITHUB_WORKSPACE" \
+            -maxdepth 3 \
+            -type f \
+            -iname '*.zip' \
+            -not -path '*/output/*' \
+            -printf '%T@\t%p\n' \
+            | sort -nr \
+            | head -n 1 \
+            | cut -f2- || true)"
 
           if [[ -z "$ZIP" ]]; then
-            echo "ERROR: No source ZIP found in repository."
+            echo "ERROR: No source ZIP found."
             exit 1
           fi
 
           echo "Selected ZIP: $ZIP"
 
           mkdir -p "$RUNNER_TEMP/frago-source"
-
           unzip -q "$ZIP" -d "$RUNNER_TEMP/frago-source"
 
           PROJECT="$(find "$RUNNER_TEMP/frago-source" \
@@ -67,8 +62,7 @@ jobs:
             -print -quit | xargs -r dirname)"
 
           if [[ -z "$PROJECT" ]]; then
-            echo "ERROR: Gradle project not found in ZIP."
-            find "$RUNNER_TEMP/frago-source" -maxdepth 4 -type f | head -100
+            echo "ERROR: Gradle project not found inside ZIP."
             exit 1
           fi
 
@@ -80,10 +74,10 @@ jobs:
 
           echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
 
-          echo "Extracted project:"
+          echo "Project detected:"
           echo "$PROJECT"
 
-      # 4. نصب Android SDK
+      # 4. نصب Java و Android SDK
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
@@ -105,7 +99,10 @@ jobs:
 
           NDK="$ANDROID_SDK_ROOT/ndk/28.2.13676358"
 
-          test -x "$NDK/ndk-build"
+          if [[ ! -x "$NDK/ndk-build" ]]; then
+            echo "ERROR: NDK installation failed."
+            exit 1
+          fi
 
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
@@ -123,22 +120,63 @@ jobs:
           test -f gradle/wrapper/gradle-wrapper.properties
           test -f app/src/main/AndroidManifest.xml
 
-          echo "Gradle wrapper:"
+          echo "Gradle configuration:"
           cat gradle/wrapper/gradle-wrapper.properties
 
           echo "Android project validation passed."
 
-      # 7. نصب Go
-      - name: Setup Go
+      # 7. نصب Go نسخه موردنیاز libXray
+      - name: Setup Go 1.27.3
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.x'
+          go-version: '1.27.3'
+          check-latest: true
 
-      # 8. ساخت موتور Xray
-      - name: Build libXray engine
+      # 8. تنظیم و بررسی Toolchain
+      - name: Verify Go toolchain
         shell: bash
         run: |
           set -euo pipefail
+
+          echo "GOTOOLCHAIN=auto" >> "$GITHUB_ENV"
+
+          export GOTOOLCHAIN=auto
+
+          go version
+          go env GOVERSION
+          go env GOTOOLCHAIN
+
+      # 9. نصب ابزارهای موردنیاز موتور
+      - name: Install Xray build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            git \
+            python3 \
+            python3-pip \
+            unzip \
+            zip \
+            make \
+            clang \
+            cmake
+
+          python3 --version
+          git --version
+          go version
+
+      # 10. دریافت و ساخت موتور Xray
+      - name: Build libXray Android engine
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export GOTOOLCHAIN=auto
+          export ANDROID_NDK_HOME
+          export ANDROID_NDK_ROOT
 
           mkdir -p "$PROJECT_DIR/app/libs"
 
@@ -148,29 +186,63 @@ jobs:
 
           cd "$RUNNER_TEMP/libXray"
 
-          export ANDROID_NDK_HOME
-          export ANDROID_NDK_ROOT
+          echo "libXray Go requirements:"
+          head -n 10 go.mod
+
+          echo "Go version:"
+          go version
 
           python3 build/main.py android
 
           AAR="$(find "$RUNNER_TEMP/libXray" \
-            -type f -iname '*.aar' -print -quit)"
+            -type f \
+            -iname '*.aar' \
+            -print -quit)"
 
           if [[ -z "$AAR" || ! -s "$AAR" ]]; then
             echo "ERROR: libXray AAR was not generated."
-            find "$RUNNER_TEMP/libXray" -type f \
+
+            find "$RUNNER_TEMP/libXray" \
+              -type f \
               | grep -Ei '\.(aar|so)$' || true
+
             exit 1
           fi
 
-          echo "Generated engine:"
+          echo "Generated AAR:"
           ls -lh "$AAR"
 
           cp "$AAR" "$PROJECT_DIR/app/libs/libXray.aar"
 
-          echo "Xray engine copied."
+          echo "Checking ARM64 native libraries:"
 
-      # 9. ساخت APK
+          unzip -l "$PROJECT_DIR/app/libs/libXray.aar" \
+            | grep 'jni/arm64-v8a/' || {
+              echo "ERROR: ARM64 library missing from AAR."
+              exit 1
+            }
+
+          echo "libXray engine copied successfully."
+
+      # 11. بررسی وابستگی موتور در Gradle
+      - name: Verify Xray dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          if ! grep -Rqs \
+            'libXray.aar\|libs/\*\.aar' \
+            app/build.gradle app/build.gradle.kts 2>/dev/null; then
+            echo "ERROR: libXray.aar is not declared as a Gradle dependency."
+            echo "The AAR was built but is not linked to the Android app."
+            exit 1
+          fi
+
+          echo "Xray dependency declaration found."
+
+      # 12. ساخت APK
       - name: Build Frago APK
         shell: bash
         run: |
@@ -180,6 +252,7 @@ jobs:
 
           export ANDROID_NDK_HOME
           export ANDROID_NDK_ROOT
+          export GOTOOLCHAIN=auto
 
           ./gradlew \
             --no-daemon \
@@ -187,14 +260,16 @@ jobs:
             clean \
             assembleDebug
 
-      # 10. بررسی خروجی
+      # 13. بررسی خروجی
       - name: Verify APK
         shell: bash
         run: |
           set -euo pipefail
 
           APK="$(find "$PROJECT_DIR/app/build/outputs/apk" \
-            -type f -name '*.apk' -print -quit)"
+            -type f \
+            -name '*.apk' \
+            -print -quit)"
 
           if [[ -z "$APK" || ! -s "$APK" ]]; then
             echo "ERROR: APK was not generated."
@@ -203,7 +278,8 @@ jobs:
 
           mkdir -p "$GITHUB_WORKSPACE/output"
 
-          cp "$APK" "$GITHUB_WORKSPACE/output/Frago-1.2.0.apk"
+          cp "$APK" \
+            "$GITHUB_WORKSPACE/output/Frago-1.2.0.apk"
 
           echo "APK size:"
           du -h "$GITHUB_WORKSPACE/output/Frago-1.2.0.apk"
@@ -211,8 +287,22 @@ jobs:
           echo "APK SHA256:"
           sha256sum "$GITHUB_WORKSPACE/output/Frago-1.2.0.apk"
 
-      # 11. ذخیره APK به عنوان Artifact
-      - name: Upload APK
+      # 14. بررسی معماری APK
+      - name: Verify APK architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="$GITHUB_WORKSPACE/output/Frago-1.2.0.apk"
+
+          unzip -l "$APK" | grep 'lib/arm64-v8a/' || {
+            echo "WARNING: ARM64 native libraries were not found."
+          }
+
+          echo "APK architecture inspection completed."
+
+      # 15. انتشار APK
+      - name: Upload Frago APK
         uses: actions/upload-artifact@v4
         with:
           name: Frago-1.2.0-Android-APK
@@ -220,14 +310,14 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # 12. ذخیره گزارش ساخت
+      # 16. ذخیره گزارش‌ها در صورت خطا یا موفقیت
       - name: Upload build reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: Frago-build-reports
+          name: Frago-Build-Reports
           path: |
-            ${{ env.PROJECT_DIR }}/app/build/outputs/
             ${{ env.PROJECT_DIR }}/app/build/reports/
+            ${{ env.PROJECT_DIR }}/app/build/outputs/logs/
           if-no-files-found: ignore
           retention-days: 7
