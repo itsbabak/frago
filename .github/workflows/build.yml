@@ -1,83 +1,29 @@
-name: Build Frago Android APK
-
-on:
-  push:
-    branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
-  workflow_dispatch:
-
-jobs:
-  build:
-    name: Build Frago Debug APK
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Detect ZIP or direct source directory
-        id: locate
+      - name: Extract source ZIP
+        shell: bash
         run: |
-          if [ -f "settings.gradle" ] && [ -d "app" ]; then
-            echo "project_dir=." >> "$GITHUB_OUTPUT"
-          elif [ -f "Frago/settings.gradle" ] && [ -d "Frago/app" ]; then
-            echo "project_dir=Frago" >> "$GITHUB_OUTPUT"
-          else
-            LATEST_ZIP=$(ls -t *.zip 2>/dev/null | head -n 1 || true)
-            if [ -z "$LATEST_ZIP" ]; then
-              echo "No Android project or ZIP archive found!"
-              exit 1
-            fi
-            mkdir -p frago-extracted
-            unzip -q "$LATEST_ZIP" -d frago-extracted
-            FOUND_SETTINGS=$(find frago-extracted -maxdepth 3 -name "settings.gradle" | head -n 1)
-            if [ -z "$FOUND_SETTINGS" ]; then
-              echo "settings.gradle not found inside $LATEST_ZIP"
-              exit 1
-            fi
-            echo "project_dir=$(dirname "$FOUND_SETTINGS")" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          ZIP="$(find "$GITHUB_WORKSPACE" \
+            -maxdepth 2 -type f -iname '*.zip' \
+            -not -path '*/output/*' \
+            | head -n 1)"
+
+          if [ -z "$ZIP" ]; then
+            echo "No source ZIP found"
+            exit 1
           fi
 
-      - name: Setup JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
-          cache: gradle
+          mkdir -p "$RUNNER_TEMP/frago-source"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/frago-source"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: 'platform-tools platforms;android-34 build-tools;34.0.0 ndk;26.3.11579264'
+          PROJECT="$(find "$RUNNER_TEMP/frago-source" \
+            -type f -name gradlew \
+            -print -quit | xargs -r dirname)"
 
-      - name: Validate Frago source files
-        working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: |
-          test -f app/src/main/java/net/typeblog/socks/util/UniversalProxyRelay.java
-          test -f app/src/main/java/net/typeblog/socks/ProfileFragment.java
-          test -f app/src/main/java/net/typeblog/socks/SocksVpnService.java
-          chmod +x gradlew
-          if [ -f app/src/main/build-jni.sh ]; then chmod +x app/src/main/build-jni.sh; fi
-          if [ -f app/src/main/build-byedpi.sh ]; then chmod +x app/src/main/build-byedpi.sh; fi
+          if [ -z "$PROJECT" ]; then
+            echo "Gradle project not found inside ZIP"
+            exit 1
+          fi
 
-      - name: Build native libraries (if needed)
-        working-directory: ${{ steps.locate.outputs.project_dir }}/app/src/main
-        run: |
-          NDK_DIR="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}/ndk/26.3.11579264"
-          export ANDROID_NDK_HOME="$NDK_DIR"
-          export PATH="$NDK_DIR:$PATH"
-          which ndk-build
-          if [ -f build-jni.sh ]; then ./build-jni.sh; fi
-          if [ -f build-byedpi.sh ]; then ./build-byedpi.sh; fi
-
-      - name: Build Frago Debug APK
-        working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
-
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Frago-Debug-APK
-          path: ${{ steps.locate.outputs.project_dir }}/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+          echo "Project extracted: $PROJECT"
