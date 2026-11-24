@@ -128,15 +128,13 @@ jobs:
             exit 0
           fi
 
-          # Optional: connect to a remote ADB target if ADB_TARGET secret/env is set (e.g. IP:PORT)
           if [[ -n "${ADB_TARGET:-}" ]]; then
-            adb connect "$ADB_TARGET" || true
+            timeout 5 adb connect "$ADB_TARGET" || true
           fi
 
-          adb wait-for-device || true
           DEVICES="$(adb devices | awk 'NR>1 && $2=="device" {print $1}')"
           if [[ -z "$DEVICES" ]]; then
-            echo "No connected ADB device/emulator detected on GitHub runner. APK is ready in output/Frago-1.1.10-debug.apk"
+            echo "No connected ADB device/emulator detected. Skipping install; APK is ready in output/Frago-1.1.10-debug.apk"
             exit 0
           fi
 
