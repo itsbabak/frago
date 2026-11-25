@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: frago-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: Build Frago APK
@@ -37,7 +41,7 @@ jobs:
               -not -path '*/.git/*' | head -n 1 || true)"
 
             if [[ -z "$ZIP_FILE" ]]; then
-              echo "::error::Android source ZIP not found"
+              echo "::error::Android source not found"
               exit 1
             fi
 
@@ -54,7 +58,6 @@ jobs:
           fi
 
           echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
-          echo "Project directory: $PROJECT"
 
       - name: Setup JDK 17
         uses: actions/setup-java@v5
@@ -75,27 +78,21 @@ jobs:
 
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
-          if [[ ! -f "$SDKMANAGER" ]]; then
+          if [[ ! -x "$SDKMANAGER" ]]; then
             SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
               -type f -name sdkmanager | head -n 1)"
           fi
 
-          if [[ ! -x "$SDKMANAGER" ]]; then
-            echo "::error::SDK Manager not found"
-            exit 1
-          fi
+          test -x "$SDKMANAGER"
 
           echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-
-          "$SDKMANAGER" --version
 
       - name: Install Android SDK and NDK
         shell: bash
         run: |
           set -euo pipefail
 
-          yes | "$SDKMANAGER" --licenses \
-            >/dev/null 2>&1 || true
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
 
           "$SDKMANAGER" --install \
             "platform-tools" \
@@ -105,24 +102,52 @@ jobs:
 
           NDK="$ANDROID_HOME/ndk/28.2.13676358"
 
-          if [[ ! -x "$NDK/ndk-build" ]]; then
-            echo "::error::NDK installation incomplete"
-            exit 1
-          fi
+          test -x "$NDK/ndk-build"
 
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
 
-          echo "NDK ready"
-
-      - name: Validate project files
+      # Add an alternative Maven Central mirror
+      - name: Configure Maven mirrors
         shell: bash
         run: |
           set -euo pipefail
 
           cd "$PROJECT_DIR"
 
-          REQUIRED_FILES=(
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("build.gradle")
+          content = path.read_text()
+
+          mirror = """
+                  maven {
+                      url 'https://maven-central.storage-download.googleapis.com/maven2'
+                  }
+          """
+
+          if "maven-central.storage-download.googleapis.com" not in content:
+              content = content.replace(
+                  "mavenCentral()",
+                  mirror + "\n        mavenCentral()"
+              )
+
+          path.write_text(content)
+
+          print("Maven Central mirror configured")
+          PY
+
+          cat build.gradle
+
+      - name: Validate source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$PROJECT_DIR"
+
+          FILES=(
             settings.gradle
             build.gradle
             gradlew
@@ -135,29 +160,23 @@ jobs:
             app/src/main/build-byedpi.sh
           )
 
-          for FILE in "${REQUIRED_FILES[@]}"; do
-            if [[ ! -f "$FILE" ]]; then
-              echo "::error::Missing project file: $FILE"
+          for f in "${FILES[@]}"; do
+            test -f "$f" || {
+              echo "::error::Missing $f"
               exit 1
-            fi
+            }
           done
 
           chmod +x gradlew
           chmod +x app/src/main/build-byedpi.sh
 
-          echo "Project files verified"
+          echo "Source validation passed"
 
-          echo "Android configuration:"
-          grep -nE 'compileSdk|ndkVersion|abiFilters' \
-            app/build.gradle || true
-
-          echo "Native configuration:"
-          cat app/src/main/jni/Application.mk
-
-      - name: Build Frago Debug APK
+      # Build with retry
+      - name: Build Frago APK
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
           cd "$PROJECT_DIR"
 
@@ -168,10 +187,36 @@ jobs:
 
           ./gradlew \
             --no-daemon \
+            --max-workers=2 \
             --stacktrace \
-            --warning-mode all \
-            clean \
-            assembleDebug
+            clean || exit 1
+
+          SUCCESS=0
+
+          for attempt in 1 2 3; do
+            echo "Build attempt $attempt of 3"
+
+            if ./gradlew \
+              --no-daemon \
+              --max-workers=2 \
+              --stacktrace \
+              --refresh-dependencies \
+              assembleDebug; then
+              SUCCESS=1
+              break
+            fi
+
+            echo "Build attempt $attempt failed"
+
+            if [[ "$attempt" -lt 3 ]]; then
+              sleep $((attempt * 20))
+            fi
+          done
+
+          if [[ "$SUCCESS" -ne 1 ]]; then
+            echo "::error::Frago build failed after 3 attempts"
+            exit 1
+          fi
 
       - name: Verify APK
         shell: bash
@@ -181,9 +226,7 @@ jobs:
           APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
           if [[ ! -s "$APK" ]]; then
-            echo "::error::APK was not generated"
-            find "$PROJECT_DIR/app/build/outputs" \
-              -type f -name '*.apk' || true
+            echo "::error::APK not generated"
             exit 1
           fi
 
@@ -191,11 +234,10 @@ jobs:
 
           cp "$APK" "$GITHUB_WORKSPACE/output/Frago-1.1.10.apk"
 
-          echo "APK generated successfully"
           ls -lh "$GITHUB_WORKSPACE/output/"
           sha256sum "$GITHUB_WORKSPACE/output/Frago-1.1.10.apk"
 
-      - name: Upload Frago APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Frago-1.1.10-APK
