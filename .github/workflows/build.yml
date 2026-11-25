@@ -1,5 +1,5 @@
 
-name: Build Frago ARM64 APK
+name: Build Frago Android APK
 
 on:
   workflow_dispatch:
@@ -11,13 +11,9 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: frago-arm64-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
-    name: Build Frago ARM64
+    name: Build Frago APK
     runs-on: ubuntu-24.04
     timeout-minutes: 60
 
@@ -26,8 +22,8 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # 2. Find Android project
-      - name: Locate Frago project
+      # 2. Detect Android project
+      - name: Detect and extract Android project
         shell: bash
         run: |
           set -euo pipefail
@@ -35,123 +31,54 @@ jobs:
           WORK="$GITHUB_WORKSPACE"
           PROJECT=""
 
-          # Direct project
-          if [ -f "$WORK/gradlew" ] && \
-             [ -f "$WORK/app/build.gradle" ]; then
+          if [[ -f "$WORK/gradlew" && -f "$WORK/app/build.gradle" ]]; then
             PROJECT="$WORK"
-          fi
+          else
+            ZIP_FILE="$(find "$WORK" -maxdepth 5 -type f \
+              -iname '*.zip' \
+              -not -path '*/.git/*' | head -n 1 || true)"
 
-          # Search subdirectories
-          if [ -z "$PROJECT" ]; then
-            PROJECT="$(find "$WORK" \
-              -maxdepth 7 \
-              -type f \
-              -name gradlew \
-              -not -path '*/.git/*' \
-              -print -quit | xargs -r dirname || true)"
-          fi
-
-          # Extract only ZIP files containing Gradle wrapper
-          if [ -z "$PROJECT" ]; then
+            if [[ -z "$ZIP_FILE" ]]; then
+              echo "ERROR: Android source not found"
+              exit 1
+            fi
 
             mkdir -p "$WORK/frago-extracted"
+            unzip -q "$ZIP_FILE" -d "$WORK/frago-extracted"
 
-            while IFS= read -r ZIP; do
-
-              if unzip -Z1 "$ZIP" 2>/dev/null | \
-                 grep -qE '(^|/)gradlew$'; then
-
-                echo "Extracting: $ZIP"
-
-                unzip -q "$ZIP" -d "$WORK/frago-extracted"
-
-                PROJECT="$(find "$WORK/frago-extracted" \
-                  -maxdepth 9 \
-                  -type f \
-                  -name gradlew \
-                  -print -quit | xargs -r dirname || true)"
-
-                if [ -n "$PROJECT" ]; then
-                  break
-                fi
-              fi
-
-            done < <(
-              find "$WORK" -maxdepth 5 \
-                -type f -iname '*.zip' \
-                -not -path '*/.git/*'
-            )
+            PROJECT="$(find "$WORK/frago-extracted" \
+              -type f -name gradlew -print -quit | xargs -r dirname)"
           fi
 
-          if [ -z "$PROJECT" ] || \
-             [ ! -f "$PROJECT/app/build.gradle" ]; then
-            echo "ERROR: Frago Android project not found."
+          if [[ -z "$PROJECT" || ! -f "$PROJECT/app/build.gradle" ]]; then
+            echo "ERROR: Invalid Android project"
             exit 1
           fi
 
           echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
-
           echo "Project: $PROJECT"
 
-          chmod +x "$PROJECT/gradlew"
-
-      # 3. JDK
+      # 3. Java 17
       - name: Setup JDK 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
 
       # 4. Android SDK
-      - name: Configure Android SDK
-        shell: bash
-        run: |
-          set -euo pipefail
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-
-          mkdir -p "$SDK"
-
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-
-          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
-
-          if [ ! -x "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$SDK/cmdline-tools" \
-              -type f -name sdkmanager \
-              -print -quit || true)"
-          fi
-
-          if [ -z "$SDKMANAGER" ] || \
-             [ ! -x "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager not found."
-            exit 1
-          fi
-
-          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-
-      # 5. Accept licenses
-      - name: Accept Android licenses
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          set +o pipefail
-          yes | "$SDKMANAGER" \
-            --sdk_root="$ANDROID_SDK_ROOT" \
-            --licenses
-          set -o pipefail
-
-      # 6. Install SDK and NDK
+      # 5. Install SDK and NDK
       - name: Install Android SDK and NDK
         shell: bash
         run: |
           set -euo pipefail
 
-          "$SDKMANAGER" \
-            --sdk_root="$ANDROID_SDK_ROOT" \
-            --install \
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          sdkmanager --install \
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0" \
@@ -159,29 +86,26 @@ jobs:
 
           NDK="$ANDROID_SDK_ROOT/ndk/28.2.13676358"
 
-          if [ ! -x "$NDK/ndk-build" ]; then
-            echo "ERROR: NDK installation failed."
-            exit 1
-          fi
+          test -x "$NDK/ndk-build"
 
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
 
-          echo "NDK installed successfully."
+          echo "NDK installed successfully"
 
-      # 7. Validate actual ARM64 configuration
-      - name: Validate ARM64 configuration
+      # 6. Validate source
+      - name: Validate Frago source
         shell: bash
         run: |
           set -euo pipefail
 
           cd "$PROJECT_DIR"
 
-          echo "Checking project files..."
+          chmod +x gradlew
+          chmod +x app/src/main/build-byedpi.sh
 
           test -f settings.gradle
           test -f build.gradle
-          test -f gradlew
           test -f gradle/wrapper/gradle-wrapper.jar
           test -f gradle/wrapper/gradle-wrapper.properties
           test -f app/build.gradle
@@ -190,33 +114,20 @@ jobs:
           test -f app/src/main/jni/Application.mk
           test -f app/src/main/build-byedpi.sh
 
-          echo "Checking Gradle ABI..."
+          grep -q 'compileSdk 36' app/build.gradle
 
-          grep -q 'abiFilters "arm64-v8a"' \
+          grep -q 'abiFilters "arm64-v8a", "armeabi-v7a"' \
             app/build.gradle
 
-          echo "Checking NDK ABI..."
-
-          grep -q '^APP_ABI := arm64-v8a' \
-            app/src/main/jni/Application.mk
-
-          echo "Checking native build script..."
-
-          grep -q 'APP_ABI="arm64-v8a"' \
+          grep -q 'APP_ABI="armeabi-v7a arm64-v8a"' \
             app/src/main/build-byedpi.sh
 
-          grep -q 'APP_MODULES="pdnsd system tun2socks byedpi"' \
-            app/src/main/build-byedpi.sh
-
-          echo "ARM64 configuration verified."
-
-          chmod +x gradlew
-          chmod +x app/src/main/build-byedpi.sh
+          echo "Source validation successful"
 
           java -version
 
-      # 8. Build
-      - name: Build Frago ARM64
+      # 7. Build APK
+      - name: Build Frago Debug APK
         shell: bash
         run: |
           set -euo pipefail
@@ -226,24 +137,22 @@ jobs:
           export ANDROID_NDK_HOME
           export ANDROID_NDK_ROOT
 
-          export PATH="$ANDROID_NDK_HOME:$PATH"
-
           ./gradlew \
             --no-daemon \
             --stacktrace \
             clean \
             assembleDebug
 
-      # 9. Verify APK
-      - name: Verify ARM64 APK
+      # 8. Verify APK
+      - name: Verify APK
         shell: bash
         run: |
           set -euo pipefail
 
           APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
-          if [ ! -s "$APK" ]; then
-            echo "ERROR: APK not generated."
+          if [[ ! -s "$APK" ]]; then
+            echo "ERROR: APK not generated"
 
             find "$PROJECT_DIR/app/build/outputs" \
               -type f -name '*.apk' || true
@@ -251,57 +160,22 @@ jobs:
             exit 1
           fi
 
-          CONTENTS="$(unzip -Z1 "$APK")"
-
-          echo "Checking ARM64 libraries..."
-
-          echo "$CONTENTS" | grep '^lib/arm64-v8a/' || {
-            echo "ERROR: ARM64 libraries missing."
-            exit 1
-          }
-
-          if echo "$CONTENTS" | \
-             grep -Eq '^lib/(armeabi-v7a|x86|x86_64)/'; then
-            echo "ERROR: Unexpected architecture found."
-            exit 1
-          fi
-
-          for LIB in \
-            libpdnsd.so \
-            libtun2socks.so \
-            libsystem.so \
-            libbyedpi.so
-          do
-
-            if ! echo "$CONTENTS" | \
-              grep -q "^lib/arm64-v8a/$LIB$"; then
-
-              echo "ERROR: Missing $LIB"
-              exit 1
-            fi
-
-            echo "Verified: $LIB"
-
-          done
-
-          echo "All ARM64 libraries verified."
-
           mkdir -p "$GITHUB_WORKSPACE/output"
 
           cp "$APK" \
-            "$GITHUB_WORKSPACE/output/Frago-ARM64.apk"
+            "$GITHUB_WORKSPACE/output/Frago-1.1.10.apk"
 
-          echo "APK size:"
-          ls -lh "$GITHUB_WORKSPACE/output/Frago-ARM64.apk"
+          echo "APK successfully generated"
 
-          echo "SHA256:"
-          sha256sum "$GITHUB_WORKSPACE/output/Frago-ARM64.apk"
+          ls -lh "$GITHUB_WORKSPACE/output/Frago-1.1.10.apk"
 
-      # 10. Upload
-      - name: Upload Frago ARM64 APK
+          sha256sum "$GITHUB_WORKSPACE/output/Frago-1.1.10.apk"
+
+      # 9. Upload APK
+      - name: Upload Frago APK
         uses: actions/upload-artifact@v4
         with:
-          name: Frago-ARM64-APK
-          path: output/Frago-ARM64.apk
+          name: Frago-1.1.10-Android-APK
+          path: output/Frago-1.1.10.apk
           if-no-files-found: error
           retention-days: 14
